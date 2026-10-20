@@ -1,3 +1,19 @@
+//! Game Boy Memory Bus (MMU) implementation.
+//!
+//! The Sharp SM83 CPU uses a 16-bit address bus to access a unified 64 KiB memory map:
+//! - `0x0000..=0x3FFF`: 16 KiB ROM Bank 00 (Cartridge fixed bank)
+//! - `0x4000..=0x7FFF`: 16 KiB ROM Bank 01..NN (Cartridge switchable bank via MBC)
+//! - `0x8000..=0x9FFF`: 8 KiB Video RAM (VRAM)
+//! - `0xA000..=0xBFFF`: 8 KiB External Cartridge RAM (optional, banked)
+//! - `0xC000..=0xCFFF`: 4 KiB Work RAM Bank 0 (WRAM)
+//! - `0xD000..=0xDFFF`: 4 KiB Work RAM Bank 1 (WRAM)
+//! - `0xE000..=0xFDFF`: Echo of 8 KiB Internal WRAM (mirror of `0xC000..=0xDDFF`)
+//! - `0xFE00..=0xFE9F`: Sprite Attribute Table (OAM)
+//! - `0xFEA0..=0xFEFF`: Prohibited / Unusable memory
+//! - `0xFF00..=0xFF7F`: Memory Mapped I/O Registers (Joypad, Serial, Timer, Audio, PPU)
+//! - `0xFF80..=0xFFFE`: High RAM (HRAM, 127 bytes)
+//! - `0xFFFF`: Interrupt Enable Register (IE)
+
 use crate::Cartridge;
 
 /// Represents the Game Boy memory bus (MMU), routing memory accesses across all 64 KiB of address space.
