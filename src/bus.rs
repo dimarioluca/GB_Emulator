@@ -15,10 +15,12 @@
 //! - `0xFFFF`: Interrupt Enable Register (IE)
 
 use crate::Cartridge;
+use crate::timer::Timer;
 
 /// Represents the Game Boy memory bus (MMU), routing memory accesses across all 64 KiB of address space.
 pub struct Bus {
     pub cartridge: Cartridge,
+    pub timer: Timer,
     pub hram: [u8; 127], // high ram, super fast ram
     pub wram: [u8; 8192], // work ram
 
@@ -34,6 +36,7 @@ impl Bus {
     pub fn new(cartridge: Cartridge) -> Self {
         Bus {
             cartridge,
+            timer: Timer::new(),
             hram: [0; 127],
             wram: [0; 8192],
             sb: 0,
@@ -70,6 +73,7 @@ impl Bus {
             0xFEA0..=0xFEFF => 0xFF, // forbidden
             0xFF01 => self.sb,
             0xFF02 => self.sc,
+            0xFF04..=0xFF07 => self.timer.read_byte(addr),
             0xFF0F => self.if_flag,
             0xFF00..=0xFF7F => 0x00, // other I/O
             0xFF80..=0xFFFE => self.hram[(addr - 0xFF80) as usize], // HRAM
@@ -98,10 +102,58 @@ impl Bus {
                     let _ = std::io::stdout().flush();
                 }
             },
+            0xFF04..=0xFF07 => self.timer.write_byte(addr, val),
             0xFF0F => self.if_flag = val,
             0xFF00..=0xFF7F => {}, // other I/O
             0xFF80..=0xFFFE => self.hram[(addr - 0xFF80) as usize] = val, // HRAM
             0xFFFF => self.ie = val,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_test_bus() -> Bus {
+        let mut rom = vec![0; 0x8000];
+        rom[0x0104..0x0134].copy_from_slice(&[
+            0xCE, 0xED, 0x66, 0x66, 0xCC, 0x0D, 0x00, 0x0B, 0x03, 0x73, 0x00, 0x83, 0x00, 0x0C, 0x00, 0x0D,
+            0x00, 0x08, 0x11, 0x1F, 0x88, 0x89, 0x00, 0x0E, 0xDC, 0xCC, 0x6E, 0xE6, 0xDD, 0xDD, 0xD9, 0x99,
+            0xBB, 0xBB, 0x67, 0x63, 0x6E, 0x0E, 0xEC, 0xCC, 0xDD, 0xDC, 0x99, 0x9F, 0xBB, 0xB9, 0x33, 0x3E,
+        ]);
+        let mut chk = 0u8;
+        for i in 0x0134..=0x014C {
+            chk = chk.wrapping_sub(rom[i]).wrapping_sub(1);
+        }
+        rom[0x014D] = chk;
+        let cart = Cartridge::new(rom).unwrap();
+        Bus::new(cart)
+    }
+
+    #[test]
+    fn test_timer_io_access_via_bus() {
+        let mut bus = make_test_bus();
+
+        // Test DIV: advance counter directly and read through bus
+        bus.timer.div_counter = 0x1234;
+        assert_eq!(bus.read_byte(0xFF04), 0x12);
+
+        // Writing to DIV resets it
+        bus.write_byte(0xFF04, 0xFF);
+        assert_eq!(bus.read_byte(0xFF04), 0x00);
+        assert_eq!(bus.timer.div_counter, 0);
+
+        // Test TIMA (0xFF05)
+        bus.write_byte(0xFF05, 0x42);
+        assert_eq!(bus.read_byte(0xFF05), 0x42);
+
+        // Test TMA (0xFF06)
+        bus.write_byte(0xFF06, 0x80);
+        assert_eq!(bus.read_byte(0xFF06), 0x80);
+
+        // Test TAC (0xFF07): upper 5 bits read as 1
+        bus.write_byte(0xFF07, 0x05);
+        assert_eq!(bus.read_byte(0xFF07), 0x05 | 0xF8);
     }
 }
