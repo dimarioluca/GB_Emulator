@@ -6,7 +6,9 @@ mod joypad;
 mod ppu;
 mod timer;
 
+use bus::Bus;
 use cartridge::Cartridge;
+use cpu::Cpu;
 use std::env;
 use std::fs;
 
@@ -52,4 +54,14 @@ fn main() {
         cartridge.header.header_checksum,
         if cartridge.header.is_checksum_valid { "VALIDO" } else { "NON VALIDO!" }
     );
+
+    println!("\n=== Avvio Esecuzione Emulatore ===\nz");
+
+    let mut bus = Bus::new(cartridge);
+    let mut cpu = Cpu::new();
+
+    loop {
+        let cycles = cpu.step(&mut bus);
+        bus.timer.step(cycles, &mut bus.if_flag);
+    }
 }
