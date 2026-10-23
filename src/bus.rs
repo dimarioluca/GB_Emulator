@@ -15,20 +15,22 @@
 //! - `0xFFFF`: Interrupt Enable Register (IE)
 
 use crate::Cartridge;
+use crate::ppu::Ppu;
 use crate::timer::Timer;
 
 /// Represents the Game Boy memory bus (MMU), routing memory accesses across all 64 KiB of address space.
 pub struct Bus {
     pub cartridge: Cartridge,
     pub timer: Timer,
+    pub ppu: Ppu,
     pub hram: [u8; 127], // high ram, super fast ram
     pub wram: [u8; 8192], // work ram
 
     pub sb: u8, // serial buffer 0xFF01 (load here data for gamelink)
-    pub sc: u8, // serial control 0xFF02 (used to send data in sbwith gamelink)
+    pub sc: u8, // serial control 0xFF02 (used to send data in sb with gamelink)
 
     pub ie: u8, // the interrupt mask, to turn off specific interrupts
-    pub if_flag: u8, // interrupt flag, one of it's bits in set on 1 if there is a pending interrupt
+    pub if_flag: u8, // interrupt flag, one of its bits is set to 1 if there is a pending interrupt
 }
 
 impl Bus {
@@ -37,6 +39,7 @@ impl Bus {
         Bus {
             cartridge,
             timer: Timer::new(),
+            ppu: Ppu::new(),
             hram: [0; 127],
             wram: [0; 8192],
             sb: 0,
@@ -53,29 +56,33 @@ impl Bus {
         (high << 8) | low
     }
 
-    /// Writes a 16-bit word to the bus in Little-Endian format.
-    pub fn write_word(&mut self, addr: u16, val: u16) {
-        let low = val as u8;
-        let high = (val >> 8) as u8;
-        self.write_byte(addr, low);
-        self.write_byte(addr.wrapping_add(1), high);
-    }
-
     /// Reads an 8-bit byte from the 64 KiB address space.
     pub fn read_byte(&self, addr: u16) -> u8 {
         match addr {
             0x0000..=0x7FFF => self.cartridge.read(addr), // ROM
-            0x8000..=0x9FFF => 0x00,
-            0xA000..=0xBFFF => self.cartridge.read(addr), // RAM
+            0x8000..=0x9FFF => self.ppu.vram[(addr - 0x8000) as usize], // VRAM
+            0xA000..=0xBFFF => self.cartridge.read(addr), // Cartridge RAM
             0xC000..=0xDFFF => self.wram[(addr - 0xC000) as usize], // WRAM
             0xE000..=0xFDFF => self.read_byte(addr - 0x2000), // Echo WRAM
-            0xFE00..=0xFE9F => 0x00, // OAM (Object Attribute Memory) for sprites
-            0xFEA0..=0xFEFF => 0xFF, // forbidden
+            0xFE00..=0xFE9F => self.ppu.oam[(addr - 0xFE00) as usize], // OAM
+            0xFEA0..=0xFEFF => 0xFF, // Prohibited / Unusable memory area
             0xFF01 => self.sb,
             0xFF02 => self.sc,
             0xFF04..=0xFF07 => self.timer.read_byte(addr),
             0xFF0F => self.if_flag,
-            0xFF00..=0xFF7F => 0x00, // other I/O
+            0xFF40 => self.ppu.LCDC,
+            0xFF41 => self.ppu.STAT,
+            0xFF42 => self.ppu.SCY,
+            0xFF43 => self.ppu.SCX,
+            0xFF44 => self.ppu.LY,
+            0xFF45 => self.ppu.LYC,
+            0xFF46 => self.ppu.DMA,
+            0xFF47 => self.ppu.BGP,
+            0xFF48 => self.ppu.OBP0,
+            0xFF49 => self.ppu.OBP1,
+            0xFF4A => self.ppu.WY,
+            0xFF4B => self.ppu.WX,
+            0xFF00..=0xFF7F => 0x00, // other I/O registers
             0xFF80..=0xFFFE => self.hram[(addr - 0xFF80) as usize], // HRAM
             0xFFFF => self.ie,
         }
@@ -85,11 +92,11 @@ impl Bus {
     pub fn write_byte(&mut self, addr: u16, val: u8) {
         match addr {
             0x0000..=0x7FFF => self.cartridge.write(addr, val), // ROM
-            0x8000..=0x9FFF => {},
-            0xA000..=0xBFFF => self.cartridge.write(addr, val), // RAM
+            0x8000..=0x9FFF => self.ppu.vram[(addr - 0x8000) as usize] = val, // VRAM
+            0xA000..=0xBFFF => self.cartridge.write(addr, val), // Cartridge RAM
             0xC000..=0xDFFF => self.wram[(addr - 0xC000) as usize] = val, // WRAM
             0xE000..=0xFDFF => self.write_byte(addr - 0x2000, val), // Echo WRAM
-            0xFE00..=0xFE9F => {}, // OAM (Object Attribute Memory) for sprites
+            0xFE00..=0xFE9F => self.ppu.oam[(addr - 0xFE00) as usize] = val, // OAM
             0xFEA0..=0xFEFF => {}, // forbidden
             0xFF01 => self.sb = val,
             0xFF02 => {
@@ -104,10 +111,46 @@ impl Bus {
             },
             0xFF04..=0xFF07 => self.timer.write_byte(addr, val),
             0xFF0F => self.if_flag = val,
-            0xFF00..=0xFF7F => {}, // other I/O
+            0xFF40 => self.ppu.LCDC = val,
+            0xFF41 => {
+                // STAT bits 0-2 are read-only for the CPU (Mode and LYC=LY match flag).
+                // The CPU can only write bits 3-6 (interrupt enable flags).
+                self.ppu.STAT = (self.ppu.STAT & 0x07) | (val & 0xF8);
+            },
+            0xFF42 => self.ppu.SCY = val,
+            0xFF43 => self.ppu.SCX = val,
+            0xFF44 => {}, // LY is read-only; writes from CPU are ignored
+            0xFF45 => self.ppu.LYC = val,
+            0xFF46 => {
+                self.ppu.DMA = val;
+                self.perform_dma(val);
+            },
+            0xFF47 => self.ppu.BGP = val,
+            0xFF48 => self.ppu.OBP0 = val,
+            0xFF49 => self.ppu.OBP1 = val,
+            0xFF4A => self.ppu.WY = val,
+            0xFF4B => self.ppu.WX = val,
+            0xFF00..=0xFF7F => {}, // Other I/O registers
             0xFF80..=0xFFFE => self.hram[(addr - 0xFF80) as usize] = val, // HRAM
             0xFFFF => self.ie = val,
         }
+    }
+
+    /// Performs OAM DMA transfer (0xFF46): copies 160 bytes from source address to OAM.
+    fn perform_dma(&mut self, val: u8) {
+        let base_addr = (val as u16) << 8;
+        for i in 0..160 {
+            let byte = self.read_byte(base_addr + i);
+            self.ppu.oam[i as usize] = byte;
+        }
+    }
+
+    /// Writes a 16-bit word to the bus in Little-Endian format.
+    pub fn write_word(&mut self, addr: u16, val: u16) {
+        let low = val as u8;
+        let high = (val >> 8) as u8;
+        self.write_byte(addr, low);
+        self.write_byte(addr.wrapping_add(1), high);
     }
 }
 
@@ -155,5 +198,45 @@ mod tests {
         // Test TAC (0xFF07): upper 5 bits read as 1
         bus.write_byte(0xFF07, 0x05);
         assert_eq!(bus.read_byte(0xFF07), 0x05 | 0xF8);
+    }
+
+    #[test]
+    fn test_ppu_vram_and_registers_via_bus() {
+        let mut bus = make_test_bus();
+
+        // Test VRAM read/write
+        bus.write_byte(0x8000, 0xAA);
+        assert_eq!(bus.read_byte(0x8000), 0xAA);
+        assert_eq!(bus.ppu.vram[0], 0xAA);
+
+        // Test OAM read/write
+        bus.write_byte(0xFE00, 0x55);
+        assert_eq!(bus.read_byte(0xFE00), 0x55);
+        assert_eq!(bus.ppu.oam[0], 0x55);
+
+        // Test LCDC (0xFF40)
+        bus.write_byte(0xFF40, 0x93);
+        assert_eq!(bus.read_byte(0xFF40), 0x93);
+        assert_eq!(bus.ppu.LCDC, 0x93);
+
+        // Test STAT (0xFF41) - bits 0-2 are read-only
+        bus.ppu.STAT = 0x85; // bits 0-2 = 5 (101: LYC flag = 1, Mode = 1)
+        bus.write_byte(0xFF41, 0x40); // write only bit 6
+        assert_eq!(bus.read_byte(0xFF41) & 0x07, 0x05); // bits 0-2 preserved!
+        assert_eq!(bus.read_byte(0xFF41) & 0x40, 0x40); // bit 6 updated!
+
+        // Test LY (0xFF44) is read-only
+        bus.ppu.LY = 42;
+        bus.write_byte(0xFF44, 0x00);
+        assert_eq!(bus.read_byte(0xFF44), 42); // not overwritten
+
+        // Test OAM DMA (0xFF46) from WRAM
+        for i in 0..160 {
+            bus.write_byte(0xC000 + i, (i & 0xFF) as u8);
+        }
+        bus.write_byte(0xFF46, 0xC0); // Trigger DMA from 0xC000
+        for i in 0..160 {
+            assert_eq!(bus.ppu.oam[i as usize], (i & 0xFF) as u8);
+        }
     }
 }
