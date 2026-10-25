@@ -13,49 +13,49 @@ use std::env;
 use std::fs;
 
 fn main() {
-    // Leggiamo gli argomenti passati da riga di comando
+    // Read command-line arguments
     let args: Vec<String> = env::args().collect();
 
-    // Verifichiamo che sia stato passato il percorso del file ROM
+    // Verify that a ROM file path was provided
     if args.len() < 2 {
-        eprintln!("Uso: {} <percorso_rom.gb>", args.get(0).map(|s| s.as_str()).unwrap_or("GB_Emulator"));
-        eprintln!("Esempio: cargo run -- roms/dmg-acid2.gb");
+        eprintln!("Usage: {} <rom_path.gb>", args.get(0).map(|s| s.as_str()).unwrap_or("GB_Emulator"));
+        eprintln!("Example: cargo run -- roms/dmg-acid2.gb");
         return;
     }
 
     let rom_path = &args[1];
 
-    // Leggiamo tutti i byte del file in memoria
+    // Read all bytes from the ROM file into memory
     let rom_bytes = match fs::read(rom_path) {
         Ok(bytes) => bytes,
         Err(err) => {
-            eprintln!("Errore nella lettura del file {}: {}", rom_path, err);
+            eprintln!("Error reading file {}: {}", rom_path, err);
             return;
         }
     };
 
-    // Creiamo la cartuccia eseguendo il parsing dell'header
+    // Create the cartridge by parsing its header
     let cartridge = match Cartridge::new(rom_bytes) {
         Ok(cart) => cart,
         Err(err) => {
-            eprintln!("Errore nel parsing della cartuccia: {}", err);
+            eprintln!("Error parsing cartridge: {}", err);
             return;
         }
     };
 
-    println!("=== Dati Cartuccia Game Boy ===");
+    println!("=== Game Boy Cartridge Info ===");
     println!("File:             {}", rom_path);
-    println!("Titolo:           {}", cartridge.header.title);
-    println!("Tipo Cartuccia:   {:?}", cartridge.header.cartridge_type);
-    println!("Dimensione ROM:   {} KiB", cartridge.header.rom_size / 1024);
-    println!("Dimensione RAM:   {} KiB", cartridge.header.ram_size / 1024);
+    println!("Title:            {}", cartridge.header.title);
+    println!("Cartridge Type:   {:?}", cartridge.header.cartridge_type);
+    println!("ROM Size:         {} KiB", cartridge.header.rom_size / 1024);
+    println!("RAM Size:         {} KiB", cartridge.header.ram_size / 1024);
     println!(
-        "Checksum Header:  {:#04X} ({})",
+        "Header Checksum:  {:#04X} ({})",
         cartridge.header.header_checksum,
-        if cartridge.header.is_checksum_valid { "VALIDO" } else { "NON VALIDO!" }
+        if cartridge.header.is_checksum_valid { "VALID" } else { "INVALID!" }
     );
 
-    println!("\n=== Avvio Esecuzione Emulatore ===\nz");
+    println!("\n=== Starting Emulator Execution ===\n");
 
     let mut bus = Bus::new(cartridge);
     let mut cpu = Cpu::new();
@@ -63,5 +63,6 @@ fn main() {
     loop {
         let cycles = cpu.step(&mut bus);
         bus.timer.step(cycles, &mut bus.if_flag);
+        bus.ppu.step(cycles, &mut bus.if_flag);
     }
 }
