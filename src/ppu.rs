@@ -121,12 +121,178 @@ impl Ppu {
             match self.dot_clock {
                 0..=79 => self.set_mode(2, if_flag),    // Mode 2: OAM Search
                 80..=251 => self.set_mode(3, if_flag),  // Mode 3: Pixel Transfer
-                252..=455 => self.set_mode(0, if_flag), // Mode 0: H-Blank
+                252..=455 => {
+                    // Render the scanline once upon entering Mode 0 (H-Blank)
+                    if (self.STAT & 0x03) != 0 {
+                        self.render_scanline();
+                        self.set_mode(0, if_flag);
+                    }
+                },
                 _ => {}
             }
         } else {
             self.set_mode(1, if_flag); // Mode 1: V-Blank
         }
+    }
+
+    /// Converts a shade value to an RGBA color.
+    fn shade_to_rgba(shade: u8) -> [u8; 4] {
+        match shade {
+            0 => [255, 255, 255, 255], // white
+            1 => [170, 170, 170, 255], // light grey
+            2 => [85,  85,  85,  255], // dark grey
+            3 => [0,   0,   0,   255], // black
+            _ => unreachable!(),
+        }
+    }
+
+    fn render_background(&mut self) {
+        if (self.LCDC & 0x01) == 0 { // background is disabled, fill scanline with white
+            let y: usize = self.LY as usize;
+            for x in 0..160 {
+                let idx: usize = (y * 160 + x) * 4;
+                self.framebuffer[idx..idx + 4].copy_from_slice(&[255, 255, 255, 255]);
+            }
+            return;
+        }
+        else {
+            let world_y: u8 = self.LY.wrapping_add(self.SCY); // y in the background map
+            let tile_row: u8 = world_y / 8; // each tile is 8 pixels high
+            let tile_y: u8 = world_y % 8; // y within the tile
+
+            // calculate the base address of the background tile map and current row
+            let map_base: usize = if (self.LCDC & 0x08) != 0 { 0x1C00 } else { 0x1800 };
+            let row_base = map_base + (tile_row as usize) * 32;
+
+            for x in 0..160 {
+                let world_x: u8 = (x as u8).wrapping_add(self.SCX); // x in the background map
+                let tile_col: u8 = world_x / 8; // each tile is 8 pixels wide
+                let tile_x: u8 = world_x % 8; // x within the tile
+
+                // get the tile index from the background map
+                let tile_index: u8 = self.vram[row_base + (tile_col as usize)];
+
+                // determine the address of the tile data in VRAM
+                let tile_addr: usize = if (self.LCDC & 0x10) != 0 {
+                    (tile_index as usize) * 16 // unsigned addressing: 0x8000 base (0x0000 in VRAM)
+                } else {
+                    // signed addressing: 0x9000 base (0x1000 in VRAM) with signed offset
+                    (0x1000_isize + (tile_index as i8 as isize) * 16) as usize
+                };
+
+                // read the two bytes for this row of the tile
+                let byte1: u8 = self.vram[tile_addr + (tile_y as usize) * 2];
+                let byte2: u8 = self.vram[tile_addr + (tile_y as usize) * 2 + 1];
+
+                // extract the color index for this pixel
+                let bit_index: u8 = 7 - tile_x; // bits are stored MSB to LSB
+                let color_index: u8 = ((byte2 >> bit_index) & 0x01) << 1 | ((byte1 >> bit_index) & 0x01);
+
+                // apply the background palette to get the shade
+                let shade: u8 = (self.BGP >> (color_index * 2)) & 0x03;
+
+                // convert shade to RGBA and write to framebuffer
+                let rgba: [u8; 4] = Ppu::shade_to_rgba(shade);
+                let idx: usize = (self.LY as usize * 160 + x as usize) * 4;
+                self.framebuffer[idx..idx + 4].copy_from_slice(&rgba);
+            }
+        }
+    }
+
+    fn render_window(&mut self) {
+        if (self.LCDC & 0x20) == 0 || (self.LCDC & 0x01) == 0 || self.LY < self.WY || self.WX > 166 { 
+            // window is disabled, don't render anything
+            return;
+        }
+        else {
+            let tile_row: u8 = self.window_line_counter / 8; // each tile is 8 pixels high
+            let tile_y: u8 = self.window_line_counter % 8; // y within the tile
+
+            // calculate the base address of the window tile map and current row
+            let map_base: usize = if (self.LCDC & 0x40) != 0 { 0x1C00 } else { 0x1800 };
+            let row_base = map_base + (tile_row as usize) * 32;
+
+            for x in 0..160 {
+
+                if (x as i32) + 7 < (self.WX as i32) {continue;}
+
+                let window_x: u8 = (x as i32 + 7 - self.WX as i32) as u8; // x in the window map
+                let tile_col: u8 = window_x / 8; // each tile is 8 pixels wide
+                let tile_x: u8 = window_x % 8; // x within the tile
+
+                // get the tile index from the window map
+                let tile_index: u8 = self.vram[row_base + (tile_col as usize)];
+
+                // determine the address of the tile data in VRAM
+                let tile_addr: usize = if (self.LCDC & 0x10) != 0 {
+                    (tile_index as usize) * 16 // unsigned addressing: 0x8000 base (0x0000 in VRAM)
+                } else {
+                    // signed addressing: 0x9000 base (0x1000 in VRAM) with signed offset
+                    (0x1000_isize + (tile_index as i8 as isize) * 16) as usize
+                };
+
+                // read the two bytes for this row of the tile
+                let byte1: u8 = self.vram[tile_addr + (tile_y as usize) * 2];
+                let byte2: u8 = self.vram[tile_addr + (tile_y as usize) * 2 + 1];
+
+                // extract the color index for this pixel
+                let bit_index: u8 = 7 - tile_x; // bits are stored MSB to LSB
+                let color_index: u8 = ((byte2 >> bit_index) & 0x01) << 1 | ((byte1 >> bit_index) & 0x01);
+
+                // apply the window palette to get the shade
+                let shade: u8 = (self.BGP >> (color_index * 2)) & 0x03;
+
+                // convert shade to RGBA and write to framebuffer
+                let rgba: [u8; 4] = Ppu::shade_to_rgba(shade);
+                let idx: usize = (self.LY as usize * 160 + x as usize) * 4;
+                self.framebuffer[idx..idx + 4].copy_from_slice(&rgba);
+            }
+            self.window_line_counter += 1;
+        }
+    }
+
+    fn render_sprites(&mut self) {
+        if (self.LCDC & 0x02) == 0 { // sprites are disabled
+            return;
+        }
+
+        // Render sprites for the current scanline
+        let sprite_height: i32 = if (self.LCDC & 0x04) != 0 { 16 } else { 8 }; // bit 2 of LCDC decides sprites height: 0 = 8x8, 1 = 8x16
+        let mut sprites_on_line = Vec::new();
+
+        for i in 0..40 {
+            let sprite_y = (self.oam[i * 4] as i32) - 16;
+            let ly = self.LY as i32;
+
+            // Check if the sprite is on the current scanline
+            if ly >= sprite_y && ly < sprite_y + sprite_height {
+                sprites_on_line.push(i);
+
+                if sprites_on_line.len() == 10 {
+                    break; // hardware limit: max 10 sprites per scanline
+                }
+            }
+        }
+
+        // Sort sprites by X coordinate (ascending) and then by OAM index (ascending)
+        sprites_on_line.sort_by(|&a, &b| {
+            let xa: u8 = self.oam[a * 4 + 1];
+            let xb: u8 = self.oam[b * 4 + 1];
+            b.cmp(&a).then(xb.cmp(&xa))
+        });
+
+        let sprite_y = (self.oam[i * 4] as i32) - 16;
+        let sprite_x = (self.oam[i * 4 + 1] as i32) - 8;
+        let tile_index = self.oam[i * 4 + 2];
+        let flags = self.oam[i * 4 + 3];
+
+        let mut line: i32 = (self.LY as i32) - sprite_y;
+
+    }
+
+    fn render_scanline(&mut self) {
+        self.render_background();
+        self.render_window();
     }
 }
 
@@ -212,6 +378,66 @@ mod tests {
         assert_eq!(ppu.LY, 0);
         assert_eq!(ppu.dot_clock, 0);
         assert_eq!(ppu.STAT & 0x03, 0);
+    }
+
+    #[test]
+    fn test_ppu_background_render() {
+        let mut ppu = Ppu::new();
+        // LCDC: LCD on (bit 7), Tile data at 0x8000 (bit 4), BG tilemap at 0x9800 (bit 3), BG on (bit 0)
+        ppu.LCDC = 0x91;
+        // BGP: 0b11_10_01_00 (Color 3 -> Black, Color 2 -> Dark grey, Color 1 -> Light grey, Color 0 -> White)
+        ppu.BGP = 0xE4;
+
+        // Tile 0 row 0 in VRAM:
+        // Byte 1: 0b10000000 (pixel 0 bit 0 = 1)
+        // Byte 2: 0b10000000 (pixel 0 bit 1 = 1)
+        // Color for pixel 0: (1 << 1) | 1 = 3 -> Black [0, 0, 0, 255]
+        // Other pixels: Color 0 -> White [255, 255, 255, 255]
+        ppu.vram[0] = 0x80;
+        ppu.vram[1] = 0x80;
+
+        // Tilemap at 0x1800 (0x9800): tile (0, 0) = Tile 0
+        ppu.vram[0x1800] = 0;
+
+        // Render line 0
+        ppu.LY = 0;
+        ppu.render_scanline();
+
+        // Pixel 0 of line 0 should be Black
+        assert_eq!(&ppu.framebuffer[0..4], &[0, 0, 0, 255]);
+        // Pixel 1 of line 0 should be White
+        assert_eq!(&ppu.framebuffer[4..8], &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn test_ppu_window_render() {
+        let mut ppu = Ppu::new();
+        // LCDC: LCD on (bit 7), Window map at 0x9C00 (bit 6), Window on (bit 5), Tile data 0x8000 (bit 4), BG on (bit 0)
+        ppu.LCDC = 0xF1;
+        ppu.BGP = 0xE4; // Standard palette
+        ppu.WY = 10;
+        ppu.WX = 7; // Window starts at screen X = 0
+
+        // Tile 1 in VRAM: pixel 0 is Black (Color 3)
+        ppu.vram[16] = 0x80;
+        ppu.vram[17] = 0x80;
+
+        // Window tilemap at 0x1C00 (0x9C00): tile (0, 0) = Tile 1
+        ppu.vram[0x1C00] = 1;
+
+        // Line 5: before WY (10) -> Window not drawn, counter stays 0
+        ppu.LY = 5;
+        ppu.render_scanline();
+        assert_eq!(ppu.window_line_counter, 0);
+
+        // Line 10: at WY -> Window drawn, counter increments to 1
+        ppu.LY = 10;
+        ppu.render_scanline();
+        assert_eq!(ppu.window_line_counter, 1);
+
+        // Pixel 0 of line 10 should be drawn by Window (Black: [0, 0, 0, 255])
+        let idx = (10 * 160 + 0) * 4;
+        assert_eq!(&ppu.framebuffer[idx..idx + 4], &[0, 0, 0, 255]);
     }
 }
 
