@@ -110,7 +110,7 @@ pub struct Cartridge {
 
     // MBC1 state:
     pub rom_bank: u8,      // ROM bank selected right now
-    pub ram_bank: u8,      // RAM bank or if banking mode is on they act as upper bits for ROM_bank (it's oly 2 bit long)
+    pub ram_bank: u8,      // 2-bit register (0x4000-0x5FFF): upper bits 5-6 of ROM bank, or RAM bank in mode 1
     pub ram_enabled: bool, // if cartridge RAM is enabled
     pub banking_mode: u8,  // 0 = ROM banking mode, 1 = RAM banking mode
 }
@@ -144,17 +144,27 @@ impl Cartridge {
             }
             CartridgeType::Mbc1 => {
                 match addr {
-                    // the first 8KiB contain always the bak 0
+                    // fixed 16 KiB ROM bank: bank 0 in Mode 0, or bank (ram_bank << 5) in Mode 1
                     0x0000..=0x3FFF => {
-                        self.rom.get(addr as usize).copied().unwrap_or(0xFF)
+                        let num_rom_banks = (self.rom.len() / 0x4000).max(1);
+                        let raw_bank = if self.banking_mode == 1 {
+                            (self.ram_bank << 5) as usize
+                        } else {
+                            0
+                        };
+                        let bank = raw_bank % num_rom_banks;
+                        let rom_addr = bank * 0x4000 + (addr as usize);
+                        self.rom.get(rom_addr).copied().unwrap_or(0xFF)
                     }
                     // reading the chosen bank
                     0x4000..=0x7FFF => {
-                        let bank = self.rom_bank as usize;
+                        let num_rom_banks = (self.rom.len() / 0x4000).max(1);
+                        let raw_bank = ((self.ram_bank << 5) | self.rom_bank) as usize;
+                        let bank = raw_bank % num_rom_banks;
                         let relative_addr = (addr - 0x4000) as usize;
                         let rom_addr = (bank * 16384) + relative_addr;
                         
-                        self.rom.get(rom_addr % self.rom.len()).copied().unwrap_or(0xFF)
+                        self.rom.get(rom_addr).copied().unwrap_or(0xFF)
                     }
                     // reading external ram
                     0xA000..=0xBFFF => {
@@ -312,5 +322,43 @@ mod tests {
         cart.write(0x0000, 0x00);
         assert!(!cart.ram_enabled);
         assert_eq!(cart.read(0xA000), 0xFF);
+    }
+
+    #[test]
+    fn test_mbc1_large_rom_and_mode1() {
+        // 1 MiB ROM (code 0x05 = 64 banchi), MBC1+RAM (code 0x03), 32 KiB RAM (code 0x03)
+        let mut rom = make_test_rom(0x03, 0x05, 0x03);
+
+        // Riempiamo alcuni banchi notevoli per riconoscerli (preservando l'header):
+        rom[0x0000..0x0100].fill(0xAA);
+        rom[0x0150..0x4000].fill(0xAA);
+        rom[0x4000..0x8000].fill(0x11);
+        rom[32 * 0x4000..33 * 0x4000].fill(0x22);
+        rom[33 * 0x4000..34 * 0x4000].fill(0x33);
+
+        let mut cart = Cartridge::new(rom).unwrap();
+
+        // 1. In Mode 0 (default):
+        // 0x0000..=0x3FFF legge sempre il banco 0
+        assert_eq!(cart.read(0x0000), 0xAA);
+
+        // 2. Selezioniamo il banco 33 impostando ram_bank = 1 (bit 5) e rom_bank = 1
+        cart.write(0x4000, 1); // ram_bank = 1 (bit 5 = 1 => 32)
+        cart.write(0x2000, 1); // rom_bank = 1 => 32 | 1 = banco 33
+        assert_eq!(cart.read(0x4000), 0x33); // Banco 33 accessibile!
+        // In Mode 0, l'area 0x0000..=0x3FFF continua a puntare al banco 0
+        assert_eq!(cart.read(0x0000), 0xAA);
+
+        // 3. Passiamo a Mode 1 (Advanced Banking Mode)
+        cart.write(0x6000, 1);
+        // In Mode 1, 0x0000..=0x3FFF mappa (ram_bank << 5) = banco 32 (0x20)!
+        assert_eq!(cart.read(0x0000), 0x22);
+
+        // 4. Test wrapping / mascheramento dei banchi:
+        // Se chiediamo il banco 65 (bit 6 = 1, bit 0 = 1 => 64 | 1 = 65),
+        // su una ROM da 64 banchi (0..63), 65 % 64 = banco 1 (0x11)!
+        cart.write(0x4000, 2); // bit 6 = 1 => 64
+        cart.write(0x2000, 1); // banco 65
+        assert_eq!(cart.read(0x4000), 0x11); // Wrappato correttamente al banco 1
     }
 }
