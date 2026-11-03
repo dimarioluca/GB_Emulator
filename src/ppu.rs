@@ -84,7 +84,7 @@ impl Ppu {
 
     /// Advances the PPU state by the given number of CPU clock cycles (dots).
     pub fn step(&mut self, cycles: u32, if_flag: &mut u8) {
-        // If LCD is disabled, keep PPU reset and in Mode 0
+        // if LCD is disabled, keep PPU reset and in Mode 0
         if (self.LCDC & 0x80) == 0 {
             self.LY = 0;
             self.dot_clock = 0;
@@ -146,7 +146,7 @@ impl Ppu {
         }
     }
 
-    fn render_background(&mut self) {
+    fn render_background(&mut self, bg_color_ids: &mut [u8; 160]) {
         if (self.LCDC & 0x01) == 0 { // background is disabled, fill scanline with white
             let y: usize = self.LY as usize;
             for x in 0..160 {
@@ -187,6 +187,7 @@ impl Ppu {
                 // extract the color index for this pixel
                 let bit_index: u8 = 7 - tile_x; // bits are stored MSB to LSB
                 let color_index: u8 = ((byte2 >> bit_index) & 0x01) << 1 | ((byte1 >> bit_index) & 0x01);
+                bg_color_ids[x] = color_index;
 
                 // apply the background palette to get the shade
                 let shade: u8 = (self.BGP >> (color_index * 2)) & 0x03;
@@ -199,7 +200,7 @@ impl Ppu {
         }
     }
 
-    fn render_window(&mut self) {
+    fn render_window(&mut self, bg_color_ids: &mut [u8; 160]) {
         if (self.LCDC & 0x20) == 0 || (self.LCDC & 0x01) == 0 || self.LY < self.WY || self.WX > 166 { 
             // window is disabled, don't render anything
             return;
@@ -238,6 +239,7 @@ impl Ppu {
                 // extract the color index for this pixel
                 let bit_index: u8 = 7 - tile_x; // bits are stored MSB to LSB
                 let color_index: u8 = ((byte2 >> bit_index) & 0x01) << 1 | ((byte1 >> bit_index) & 0x01);
+                bg_color_ids[x] = color_index;
 
                 // apply the window palette to get the shade
                 let shade: u8 = (self.BGP >> (color_index * 2)) & 0x03;
@@ -251,18 +253,18 @@ impl Ppu {
         }
     }
 
-    fn render_sprites(&mut self) {
+    fn render_sprites(&mut self, bg_color_ids: &[u8; 160]) {
         if (self.LCDC & 0x02) == 0 { // sprites are disabled
             return;
         }
 
         // Render sprites for the current scanline
         let sprite_height: i32 = if (self.LCDC & 0x04) != 0 { 16 } else { 8 }; // bit 2 of LCDC decides sprites height: 0 = 8x8, 1 = 8x16
-        let mut sprites_on_line = Vec::new();
+        let mut sprites_on_line: Vec<usize> = Vec::new();
 
         for i in 0..40 {
-            let sprite_y = (self.oam[i * 4] as i32) - 16;
-            let ly = self.LY as i32;
+            let sprite_y: i32 = (self.oam[i * 4] as i32) - 16;
+            let ly: i32 = self.LY as i32;
 
             // Check if the sprite is on the current scanline
             if ly >= sprite_y && ly < sprite_y + sprite_height {
@@ -278,21 +280,77 @@ impl Ppu {
         sprites_on_line.sort_by(|&a, &b| {
             let xa: u8 = self.oam[a * 4 + 1];
             let xb: u8 = self.oam[b * 4 + 1];
-            b.cmp(&a).then(xb.cmp(&xa))
+            xb.cmp(&xa).then(b.cmp(&a))
         });
 
-        let sprite_y = (self.oam[i * 4] as i32) - 16;
-        let sprite_x = (self.oam[i * 4 + 1] as i32) - 8;
-        let tile_index = self.oam[i * 4 + 2];
-        let flags = self.oam[i * 4 + 3];
+        for &i in &sprites_on_line {
+            let sprite_y: i32 = (self.oam[i * 4] as i32) - 16;
+            let sprite_x: i32 = (self.oam[i * 4 + 1] as i32) - 8;
+            let tile_index: u8 = self.oam[i * 4 + 2];
+            let flags: u8 = self.oam[i * 4 + 3];
 
-        let mut line: i32 = (self.LY as i32) - sprite_y;
+            let mut line: i32 = (self.LY as i32) - sprite_y; // the line of the sprite to render
+            // if bit 6 of flags is set, the sprite is flipped vertically
+            if (flags & 0x40) != 0 {
+                line = sprite_height - 1 - line;
+            }
 
+
+            let (actual_tile, tile_row) = if sprite_height == 16 {
+                if line < 8 {
+                    (tile_index & 0xFE, line as usize)
+                } else {
+                    (tile_index | 0x01, (line - 8) as usize)
+                }
+            } else {
+                (tile_index, line as usize)
+            };
+
+            let tile_addr = (actual_tile as usize) * 16;
+            let byte1 = self.vram[tile_addr + tile_row * 2];
+            let byte2 = self.vram[tile_addr + tile_row * 2 + 1];
+
+            // add to framebuffer every pixel of the row
+            for col in 0..8 {
+                let screen_x: i32 = sprite_x + col;
+                if screen_x < 0 || screen_x >= 160 {
+                    continue; // skip pixels outside the screen
+                }
+
+                // if bit 5 of flags is set, the sprite is flipped horizontally
+                let bit_index = if (flags & 0x20) != 0 {
+                    col as u8
+                } else {
+                    7 - (col as u8)
+                };
+
+                let color_index = ((byte2 >> bit_index) & 0x01) << 1 | ((byte1 >> bit_index) & 0x01);
+
+                if color_index == 0 {
+                    continue; // skip if transparent
+                }
+
+                // Bit 7 of flags: BG-to-OBJ priority
+                // if set to 1, sprite is hidden behind BG colors 1, 2, and 3 (only visible on color 0)
+                if (flags & 0x80) != 0 && bg_color_ids[screen_x as usize] != 0 {
+                    continue;
+                }
+
+                let palette = if (flags & 0x10) != 0 { self.OBP1 } else { self.OBP0 };
+                let shade = (palette >> (color_index * 2)) & 0x03;
+                let rgba = Ppu::shade_to_rgba(shade);
+
+                let idx = (self.LY as usize * 160 + screen_x as usize) * 4;
+                self.framebuffer[idx..idx + 4].copy_from_slice(&rgba);
+            }
+        }
     }
 
     fn render_scanline(&mut self) {
-        self.render_background();
-        self.render_window();
+        let mut bg_color_ids = [0u8; 160];
+        self.render_background(&mut bg_color_ids);
+        self.render_window(&mut bg_color_ids);
+        self.render_sprites(&bg_color_ids);
     }
 }
 
@@ -438,6 +496,39 @@ mod tests {
         // Pixel 0 of line 10 should be drawn by Window (Black: [0, 0, 0, 255])
         let idx = (10 * 160 + 0) * 4;
         assert_eq!(&ppu.framebuffer[idx..idx + 4], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn test_ppu_sprite_render_and_priority() {
+        let mut ppu = Ppu::new();
+        // LCDC: LCD on (bit 7), Tile data 0x8000 (bit 4), BG tilemap 0x9800 (bit 3), OBJ on (bit 1), BG on (bit 0)
+        ppu.LCDC = 0x93;
+        ppu.BGP = 0xE4;  // Color 3 -> Black, Color 0 -> White
+        ppu.OBP0 = 0xE4; // Color 1 -> Light grey [170, 170, 170, 255]
+
+        // Background: Tile 0 row 0 has pixel 0 as Color 3 (Black), pixel 1 as Color 0 (White)
+        ppu.vram[0] = 0x80;
+        ppu.vram[1] = 0x80;
+        ppu.vram[0x1800] = 0; // Tilemap (0, 0) = Tile 0
+
+        // Sprite 0: at screen Y = 0 (OAM Y = 16), screen X = 0 (OAM X = 8), tile 2, flags: bit 7 set (behind BG)
+        ppu.oam[0] = 16;
+        ppu.oam[1] = 8;
+        ppu.oam[2] = 2;
+        ppu.oam[3] = 0x80; // BG priority bit 7 = 1
+
+        // Tile 2 in VRAM (offset 2 * 16 = 32): row 0 has pixel 0 and pixel 1 as Color 1 (Light grey)
+        ppu.vram[32] = 0xC0; // bit 0 = 1 for pixel 0 and 1
+        ppu.vram[33] = 0x00; // bit 1 = 0 for pixel 0 and 1
+
+        ppu.LY = 0;
+        ppu.render_scanline();
+
+        // Pixel 0: BG has color 3 -> sprite is hidden behind BG -> stays Black
+        assert_eq!(&ppu.framebuffer[0..4], &[0, 0, 0, 255]);
+
+        // Pixel 1: BG has color 0 -> sprite is visible over color 0 -> Light grey
+        assert_eq!(&ppu.framebuffer[4..8], &[170, 170, 170, 255]);
     }
 }
 
