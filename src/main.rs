@@ -79,7 +79,10 @@ fn main() {
 
     let window_size = window.inner_size();
     let surface_texture = SurfaceTexture::new(window_size.width, window_size.height, &window);
-    let mut pixels = Pixels::new(GB_WIDTH, GB_HEIGHT, surface_texture).unwrap();
+
+    let mut pixels = Pixels::new(window_size.width.max(1), window_size.height.max(1), surface_texture).unwrap();
+    let mut surface_w = window_size.width.max(1);
+    let mut surface_h = window_size.height.max(1);
 
     let mut bus = Bus::new(cartridge);
     let mut cpu = Cpu::new();
@@ -93,7 +96,12 @@ fn main() {
             }
             // Window resized by user or OS
             Event::WindowEvent { event: WindowEvent::Resized(new_size), .. } => {
-                pixels.resize_surface(new_size.width, new_size.height).unwrap();
+                let w = new_size.width.max(1);
+                let h = new_size.height.max(1);
+                pixels.resize_surface(w, h).unwrap();
+                pixels.resize_buffer(w, h).unwrap();
+                surface_w = w;
+                surface_h = h;
             }
             // Window requests next frame redraw
             Event::WindowEvent { event: WindowEvent::RedrawRequested, .. } => {
@@ -105,8 +113,38 @@ fn main() {
                 }
                 bus.ppu.frame_ready = false;
 
-                // Copy framebuffer to pixels buffer
-                pixels.frame_mut().copy_from_slice(&bus.ppu.framebuffer);
+                let frame = pixels.frame_mut();
+
+                // Clear the entire buffer to black, so what is not covered remains black
+                for pixel in frame.chunks_exact_mut(4) {
+                    pixel[0] = 0;
+                    pixel[1] = 0;
+                    pixel[2] = 0;
+                    pixel[3] = 0xFF;
+                }
+
+                // Compute the largest scale that fits while preserving the 160:144 aspect ratio
+                let scale_x = surface_w as f32 / GB_WIDTH as f32;
+                let scale_y = surface_h as f32 / GB_HEIGHT as f32;
+                let scale = scale_x.min(scale_y); // the smallest one decides the scale
+
+                let scaled_w = (GB_WIDTH as f32 * scale) as u32;
+                let scaled_h = (GB_HEIGHT as f32 * scale) as u32;
+                let offset_x = (surface_w - scaled_w) / 2;
+                let offset_y = (surface_h - scaled_h) / 2;
+
+                // Nearest-neighbor upscale from the PPU framebuffer into the window-sized buffer
+                let src = &bus.ppu.framebuffer;
+                for y in 0..scaled_h {
+                    let src_y = ((y as f32 / scale) as u32).min(GB_HEIGHT - 1) as usize;
+                    let dst_row = (offset_y + y) as usize * surface_w as usize;
+                    for x in 0..scaled_w {
+                        let src_x = ((x as f32 / scale) as u32).min(GB_WIDTH - 1) as usize;
+                        let src_idx = (src_y * GB_WIDTH as usize + src_x) * 4;
+                        let dst_idx = (dst_row + (offset_x + x) as usize) * 4;
+                        frame[dst_idx..dst_idx + 4].copy_from_slice(&src[src_idx..src_idx + 4]);
+                    }
+                }
 
                 // Render frame onto the GPU
                 if let Err(err) = pixels.render() {
