@@ -15,6 +15,7 @@
 //! - `0xFFFF`: Interrupt Enable Register (IE)
 
 use crate::Cartridge;
+use crate::joypad::Joypad;
 use crate::ppu::Ppu;
 use crate::timer::Timer;
 
@@ -23,6 +24,7 @@ pub struct Bus {
     pub cartridge: Cartridge,
     pub timer: Timer,
     pub ppu: Ppu,
+    pub joypad: Joypad,
     pub hram: [u8; 127], // high ram, super fast ram
     pub wram: [u8; 8192], // work ram
 
@@ -40,6 +42,7 @@ impl Bus {
             cartridge,
             timer: Timer::new(),
             ppu: Ppu::new(),
+            joypad: Joypad::new(),
             hram: [0; 127],
             wram: [0; 8192],
             sb: 0,
@@ -66,6 +69,7 @@ impl Bus {
             0xE000..=0xFDFF => self.read_byte(addr - 0x2000), // Echo WRAM
             0xFE00..=0xFE9F => self.ppu.oam[(addr - 0xFE00) as usize], // OAM
             0xFEA0..=0xFEFF => 0xFF, // Prohibited / Unusable memory area
+            0xFF00 => self.joypad.read_byte(),
             0xFF01 => self.sb,
             0xFF02 => self.sc,
             0xFF04..=0xFF07 => self.timer.read_byte(addr),
@@ -98,6 +102,7 @@ impl Bus {
             0xE000..=0xFDFF => self.write_byte(addr - 0x2000, val), // Echo WRAM
             0xFE00..=0xFE9F => self.ppu.oam[(addr - 0xFE00) as usize] = val, // OAM
             0xFEA0..=0xFEFF => {}, // forbidden
+            0xFF00 => self.joypad.write_byte(val),
             0xFF01 => self.sb = val,
             0xFF02 => {
                 self.sc = val;
@@ -238,5 +243,24 @@ mod tests {
         for i in 0..160 {
             assert_eq!(bus.ppu.oam[i as usize], (i & 0xFF) as u8);
         }
+    }
+
+    #[test]
+    fn test_joypad_io_access_via_bus() {
+        use crate::joypad::JoypadKey;
+
+        let mut bus = make_test_bus();
+
+        // Initial read of 0xFF00: all buttons released and deselected -> 0xFF
+        assert_eq!(bus.read_byte(0xFF00), 0xFF);
+
+        // Select direction keys (bit 4 = 0, bit 5 = 1)
+        bus.write_byte(0xFF00, 0b0010_0000);
+        assert_eq!(bus.read_byte(0xFF00), 0xEF);
+
+        // Press Right button: bit 0 of 0xFF00 becomes 0, and Joypad interrupt is requested
+        bus.joypad.key_down(JoypadKey::Right, &mut bus.if_flag);
+        assert_eq!(bus.read_byte(0xFF00), 0xEE);
+        assert_eq!(bus.if_flag & 0x10, 0x10);
     }
 }

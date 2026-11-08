@@ -1,7 +1,6 @@
 mod bus;
 mod cartridge;
 mod cpu;
-mod interrupt;
 mod joypad;
 mod ppu;
 mod timer;
@@ -9,14 +8,17 @@ mod timer;
 use bus::Bus;
 use cartridge::Cartridge;
 use cpu::Cpu;
+use gilrs::{Axis, Button, EventType, Gilrs};
+use joypad::JoypadKey;
+use pixels::{Pixels, SurfaceTexture};
 use std::env;
 use std::fs;
-use pixels::{Pixels, SurfaceTexture};
-use winit::dpi::LogicalSize;
-use winit::event::{Event, WindowEvent};
-use winit::event_loop::EventLoop;
-use winit::window::WindowBuilder;
 use std::time::{Duration, Instant};
+use winit::dpi::LogicalSize;
+use winit::event::{ElementState, Event, KeyEvent, WindowEvent};
+use winit::event_loop::EventLoop;
+use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::window::WindowBuilder;
 
 fn main() {
     // Read command-line arguments
@@ -61,6 +63,19 @@ fn main() {
         if cartridge.header.is_checksum_valid { "VALID" } else { "INVALID!" }
     );
 
+    println!("\n=== Keyboard Controls ===");
+    println!("D-Pad:  Arrow Keys or W / A / S / D");
+    println!("A / B:  Z / X or J / K");
+    println!("Select: Shift or Backspace");
+    println!("Start:  Enter or Space");
+
+    println!("\n=== Gamepad Controls ===");
+    println!("Movement: D-Pad or Left Analog Stick");
+    println!("A:        South (Xbox A / PS Cross) or North (Y / Triangle)");
+    println!("B:        East (Xbox B / PS Circle) or West (X / Square)");
+    println!("Start:    Start button");
+    println!("Select:   Select / Back / Share button");
+
     println!("\n=== Starting Emulator Execution ===\n");
 
     const GB_WIDTH: u32 = 160;
@@ -88,11 +103,48 @@ fn main() {
     let mut cpu = Cpu::new();
     let mut last_frame_time = Instant::now();
 
+    // Initialize Gamepad subsystem (gilrs)
+    let mut gilrs = match Gilrs::new() {
+        Ok(g) => Some(g),
+        Err(err) => {
+            eprintln!("Warning: could not initialize gamepad subsystem: {}", err);
+            None
+        }
+    };
+
+    let mut stick_left = false;
+    let mut stick_right = false;
+    let mut stick_up = false;
+    let mut stick_down = false;
+    const STICK_DEADZONE: f32 = 0.5;
+
     event_loop.run(move |event, elwt| {
         match event {
             // Window close button clicked
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
                 elwt.exit();
+            }
+            // Keyboard input events
+            Event::WindowEvent {
+                event: WindowEvent::KeyboardInput {
+                    event: KeyEvent {
+                        physical_key: PhysicalKey::Code(key_code),
+                        state,
+                        repeat,
+                        ..
+                    },
+                    ..
+                },
+                ..
+            } => {
+                if !repeat {
+                    if let Some(key) = map_key_code(key_code) {
+                        match state {
+                            ElementState::Pressed => bus.joypad.key_down(key, &mut bus.if_flag),
+                            ElementState::Released => bus.joypad.key_up(key),
+                        }
+                    }
+                }
             }
             // Window resized by user or OS
             Event::WindowEvent { event: WindowEvent::Resized(new_size), .. } => {
@@ -105,6 +157,78 @@ fn main() {
             }
             // Window requests next frame redraw
             Event::WindowEvent { event: WindowEvent::RedrawRequested, .. } => {
+                // Poll all pending gamepad events from gilrs
+                if let Some(ref mut g) = gilrs {
+                    while let Some(gilrs_event) = g.next_event() {
+                        match gilrs_event.event {
+                            EventType::ButtonPressed(button, _) => {
+                                if let Some(key) = map_gamepad_button(button) {
+                                    bus.joypad.key_down(key, &mut bus.if_flag);
+                                }
+                            }
+                            EventType::ButtonReleased(button, _) => {
+                                if let Some(key) = map_gamepad_button(button) {
+                                    bus.joypad.key_up(key);
+                                }
+                            }
+                            EventType::AxisChanged(axis, value, _) => {
+                                match axis {
+                                    Axis::LeftStickX | Axis::DPadX => {
+                                        let new_right = value > STICK_DEADZONE;
+                                        let new_left = value < -STICK_DEADZONE;
+
+                                        if new_right != stick_right {
+                                            stick_right = new_right;
+                                            if new_right {
+                                                bus.joypad.key_down(JoypadKey::Right, &mut bus.if_flag);
+                                            } else {
+                                                bus.joypad.key_up(JoypadKey::Right);
+                                            }
+                                        }
+                                        if new_left != stick_left {
+                                            stick_left = new_left;
+                                            if new_left {
+                                                bus.joypad.key_down(JoypadKey::Left, &mut bus.if_flag);
+                                            } else {
+                                                bus.joypad.key_up(JoypadKey::Left);
+                                            }
+                                        }
+                                    }
+                                    Axis::LeftStickY | Axis::DPadY => {
+                                        let new_up = value > STICK_DEADZONE;
+                                        let new_down = value < -STICK_DEADZONE;
+
+                                        if new_up != stick_up {
+                                            stick_up = new_up;
+                                            if new_up {
+                                                bus.joypad.key_down(JoypadKey::Up, &mut bus.if_flag);
+                                            } else {
+                                                bus.joypad.key_up(JoypadKey::Up);
+                                            }
+                                        }
+                                        if new_down != stick_down {
+                                            stick_down = new_down;
+                                            if new_down {
+                                                bus.joypad.key_down(JoypadKey::Down, &mut bus.if_flag);
+                                            } else {
+                                                bus.joypad.key_up(JoypadKey::Down);
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            EventType::Connected => {
+                                println!("Gamepad connected: {}", g.gamepad(gilrs_event.id).name());
+                            }
+                            EventType::Disconnected => {
+                                println!("Gamepad disconnected: {}", g.gamepad(gilrs_event.id).name());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
                 // Run CPU, Timer, and PPU cycles until an entire frame (144 scanlines) is complete
                 while !bus.ppu.frame_ready {
                     let cycles = cpu.step(&mut bus);
@@ -167,4 +291,34 @@ fn main() {
             _ => {}
         }
     }).unwrap();
+}
+
+/// Maps a physical keyboard key code from `winit` to a corresponding Game Boy [`JoypadKey`].
+fn map_key_code(key_code: KeyCode) -> Option<JoypadKey> {
+    match key_code {
+        KeyCode::ArrowRight | KeyCode::KeyD => Some(JoypadKey::Right),
+        KeyCode::ArrowLeft  | KeyCode::KeyA => Some(JoypadKey::Left),
+        KeyCode::ArrowUp    | KeyCode::KeyW => Some(JoypadKey::Up),
+        KeyCode::ArrowDown  | KeyCode::KeyS => Some(JoypadKey::Down),
+        KeyCode::KeyZ       | KeyCode::KeyJ => Some(JoypadKey::A),
+        KeyCode::KeyX       | KeyCode::KeyK => Some(JoypadKey::B),
+        KeyCode::ShiftLeft  | KeyCode::ShiftRight | KeyCode::Backspace => Some(JoypadKey::Select),
+        KeyCode::Enter      | KeyCode::Space => Some(JoypadKey::Start),
+        _ => None,
+    }
+}
+
+/// Maps a gamepad button from `gilrs` to a corresponding Game Boy [`JoypadKey`].
+fn map_gamepad_button(button: Button) -> Option<JoypadKey> {
+    match button {
+        Button::DPadUp => Some(JoypadKey::Up),
+        Button::DPadDown => Some(JoypadKey::Down),
+        Button::DPadLeft => Some(JoypadKey::Left),
+        Button::DPadRight => Some(JoypadKey::Right),
+        Button::South | Button::North => Some(JoypadKey::A),
+        Button::East | Button::West => Some(JoypadKey::B),
+        Button::Start => Some(JoypadKey::Start),
+        Button::Select => Some(JoypadKey::Select),
+        _ => None,
+    }
 }
