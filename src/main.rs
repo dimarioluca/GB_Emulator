@@ -10,9 +10,11 @@ use cartridge::Cartridge;
 use cpu::Cpu;
 use gilrs::{Axis, Button, EventType, Gilrs};
 use joypad::JoypadKey;
-use pixels::{Pixels, SurfaceTexture};
+use pixels::{PixelsBuilder, SurfaceTexture, ScalingMode};
+use pixels::wgpu::BlendState;
 use std::env;
 use std::fs;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, Event, KeyEvent, WindowEvent};
@@ -85,19 +87,27 @@ fn main() {
     const FRAME_DURATION: Duration = Duration::from_nanos(1_000_000_000 / 60);
 
     let event_loop = EventLoop::new().unwrap();
-    let window = WindowBuilder::new()
-        .with_title(format!("Game Boy - {}", cartridge.header.title))
-        .with_inner_size(LogicalSize::new(GB_WIDTH as f64 * SCALE, GB_HEIGHT as f64 * SCALE))
-        .with_min_inner_size(LogicalSize::new(GB_WIDTH as f64, GB_HEIGHT as f64))
-        .build(&event_loop)
-        .unwrap();
+    let window = Arc::new(
+        WindowBuilder::new()
+            .with_title(format!("Game Boy - {}", cartridge.header.title))
+            .with_inner_size(LogicalSize::new(GB_WIDTH as f64 * SCALE, GB_HEIGHT as f64 * SCALE))
+            .with_min_inner_size(LogicalSize::new(GB_WIDTH as f64, GB_HEIGHT as f64))
+            .build(&event_loop)
+            .unwrap(),
+    );
 
     let window_size = window.inner_size();
-    let surface_texture = SurfaceTexture::new(window_size.width, window_size.height, &window);
+    let surface_texture = SurfaceTexture::new(window_size.width, window_size.height, Arc::clone(&window));
 
-    let mut pixels = Pixels::new(window_size.width.max(1), window_size.height.max(1), surface_texture).unwrap();
-    let mut surface_w = window_size.width.max(1);
-    let mut surface_h = window_size.height.max(1);
+    let mut pixels = PixelsBuilder::new(GB_WIDTH, GB_HEIGHT, surface_texture)
+        .blend_state(BlendState::REPLACE)
+        .build()
+        .unwrap();
+
+    pixels.resize_buffer(GB_WIDTH, GB_HEIGHT).unwrap();
+    pixels.resize_surface(window_size.width, window_size.height).unwrap();
+
+    pixels.set_scaling_mode(ScalingMode::Fill);
 
     let mut bus = Bus::new(cartridge);
     let mut cpu = Cpu::new();
@@ -151,9 +161,6 @@ fn main() {
                 let w = new_size.width.max(1);
                 let h = new_size.height.max(1);
                 pixels.resize_surface(w, h).unwrap();
-                pixels.resize_buffer(w, h).unwrap();
-                surface_w = w;
-                surface_h = h;
             }
             // Window requests next frame redraw
             Event::WindowEvent { event: WindowEvent::RedrawRequested, .. } => {
@@ -247,28 +254,10 @@ fn main() {
                     pixel[3] = 0xFF;
                 }
 
-                // Compute the largest scale that fits while preserving the 160:144 aspect ratio
-                let scale_x = surface_w as f32 / GB_WIDTH as f32;
-                let scale_y = surface_h as f32 / GB_HEIGHT as f32;
-                let scale = scale_x.min(scale_y); // the smallest one decides the scale
-
-                let scaled_w = (GB_WIDTH as f32 * scale) as u32;
-                let scaled_h = (GB_HEIGHT as f32 * scale) as u32;
-                let offset_x = (surface_w - scaled_w) / 2;
-                let offset_y = (surface_h - scaled_h) / 2;
-
-                // Nearest-neighbor upscale from the PPU framebuffer into the window-sized buffer
+                let frame = pixels.frame_mut();
                 let src = &bus.ppu.framebuffer;
-                for y in 0..scaled_h {
-                    let src_y = ((y as f32 / scale) as u32).min(GB_HEIGHT - 1) as usize;
-                    let dst_row = (offset_y + y) as usize * surface_w as usize;
-                    for x in 0..scaled_w {
-                        let src_x = ((x as f32 / scale) as u32).min(GB_WIDTH - 1) as usize;
-                        let src_idx = (src_y * GB_WIDTH as usize + src_x) * 4;
-                        let dst_idx = (dst_row + (offset_x + x) as usize) * 4;
-                        frame[dst_idx..dst_idx + 4].copy_from_slice(&src[src_idx..src_idx + 4]);
-                    }
-                }
+                
+                frame.copy_from_slice(src);
 
                 // Render frame onto the GPU
                 if let Err(err) = pixels.render() {
