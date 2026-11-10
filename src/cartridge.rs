@@ -102,6 +102,133 @@ impl CartridgeHeader {
     }
 }
 
+/// Represents the Real-Time Clock (RTC) chip found in MBC3 cartridges.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct Rtc {
+    // Active registers (0x08..=0x0C)
+    pub seconds: u8,
+    pub minutes: u8,
+    pub hours: u8,
+    pub days_low: u8,
+    pub days_high: u8, // bit 0: day bit 8, bit 6: halt, bit 7: day carry
+
+    // Latched registers (frozen snapshot read at 0xA000..=0xBFFF)
+    pub latched_seconds: u8,
+    pub latched_minutes: u8,
+    pub latched_hours: u8,
+    pub latched_days_low: u8,
+    pub latched_days_high: u8,
+
+    // Base time tracking for real-time advancement
+    pub last_time: Option<std::time::Instant>,
+}
+
+impl Default for Rtc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[allow(dead_code)]
+impl Rtc {
+    /// Creates a new [`Rtc`] instance with initial zeroed registers and real-time tracking enabled.
+    pub fn new() -> Self {
+        Self {
+            seconds: 0,
+            minutes: 0,
+            hours: 0,
+            days_low: 0,
+            days_high: 0,
+            latched_seconds: 0,
+            latched_minutes: 0,
+            latched_hours: 0,
+            latched_days_low: 0,
+            latched_days_high: 0,
+            last_time: Some(std::time::Instant::now()),
+        }
+    }
+
+    /// Latches the current RTC registers into the read buffers.
+    pub fn latch(&mut self) {
+        self.update_time();
+        self.latched_seconds = self.seconds;
+        self.latched_minutes = self.minutes;
+        self.latched_hours = self.hours;
+        self.latched_days_low = self.days_low;
+        self.latched_days_high = self.days_high;
+    }
+
+    /// Reads a latched RTC register (0x08..=0x0C).
+    pub fn read_reg(&self, reg: u8) -> u8 {
+        match reg {
+            0x08 => self.latched_seconds,
+            0x09 => self.latched_minutes,
+            0x0A => self.latched_hours,
+            0x0B => self.latched_days_low,
+            0x0C => self.latched_days_high,
+            _ => 0xFF,
+        }
+    }
+
+    /// Writes to an active RTC register (0x08..=0x0C).
+    pub fn write_reg(&mut self, reg: u8, val: u8) {
+        match reg {
+            0x08 => self.seconds = val & 0x3F,   // 0..=59
+            0x09 => self.minutes = val & 0x3F,   // 0..=59
+            0x0A => self.hours = val & 0x1F,     // 0..=23
+            0x0B => self.days_low = val,
+            0x0C => self.days_high = val & 0xC1, // bit 0: day bit 8, bit 6: halt, bit 7: carry
+            _ => {}
+        }
+    }
+
+    /// Updates internal time registers based on elapsed real-world time.
+    pub fn update_time(&mut self) {
+        if let Some(last) = self.last_time {
+            let now = std::time::Instant::now();
+            let elapsed = now.duration_since(last).as_secs();
+            if elapsed > 0 {
+                self.last_time = Some(now);
+                if (self.days_high & 0x40) == 0 {
+                    self.add_seconds(elapsed);
+                }
+            }
+        } else {
+            self.last_time = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Adds seconds to the active RTC registers, propagating carries to minutes, hours, and days.
+    pub fn add_seconds(&mut self, secs: u64) {
+        if secs == 0 || (self.days_high & 0x40) != 0 {
+            return;
+        }
+        let total_secs = self.seconds as u64 + secs;
+        self.seconds = (total_secs % 60) as u8;
+
+        let total_mins = self.minutes as u64 + (total_secs / 60);
+        self.minutes = (total_mins % 60) as u8;
+
+        let total_hours = self.hours as u64 + (total_mins / 60);
+        self.hours = (total_hours % 24) as u8;
+
+        let total_days = self.days() as u64 + (total_hours / 24);
+        let day_count = (total_days % 512) as u16;
+        self.days_low = (day_count & 0xFF) as u8;
+
+        let day_bit_8 = ((day_count >> 8) & 1) as u8;
+        let carry = if total_days >= 512 { 0x80 } else { self.days_high & 0x80 };
+        let halt = self.days_high & 0x40;
+        self.days_high = carry | halt | day_bit_8;
+    }
+
+    /// Returns the full 9-bit day count (0..=511).
+    pub fn days(&self) -> u16 {
+        ((self.days_high as u16 & 1) << 8) | (self.days_low as u16)
+    }
+}
+
 /// Controller-specific state and logic for different cartridge types.
 #[derive(Debug)]
 pub enum Mbc {
@@ -116,7 +243,13 @@ pub enum Mbc {
         rom_bank: u8,      // ROM bank selected (1..=15, 4 bit)
         ram_enabled: bool, // if cartridge RAM is enabled
     },
-    Mbc3,
+    Mbc3 {
+        rom_bank: u8,         // 7-bit ROM bank selected (1..=127)
+        ram_bank_or_rtc: u8, // RAM bank (0x00..=0x03) or RTC register (0x08..=0x0C)
+        ram_enabled: bool,    // if cartridge RAM and RTC registers are enabled
+        rtc: Rtc,
+        rtc_latch: u8,        // previous value written to 0x6000..=0x7FFF
+    },
     Mbc5,
 }
 
@@ -152,7 +285,13 @@ impl Cartridge {
                 rom_bank: 1,
                 ram_enabled: false,
             },
-            CartridgeType::Mbc3 => Mbc::Mbc3,
+            CartridgeType::Mbc3 => Mbc::Mbc3 {
+                rom_bank: 1,
+                ram_bank_or_rtc: 0,
+                ram_enabled: false,
+                rtc: Rtc::new(),
+                rtc_latch: 0xFF,
+            },
             CartridgeType::Mbc5 => Mbc::Mbc5,
             CartridgeType::Unsupported(_) => Mbc::RomOnly,
         };
@@ -165,12 +304,13 @@ impl Cartridge {
         })
     }
 
-    // Helper to inspect mbc state
+    // Helper methods to inspect MBC state (useful for tests and debugging)
     #[allow(dead_code)]
     pub fn rom_bank(&self) -> u8 {
         match &self.mbc {
             Mbc::Mbc1 { rom_bank, .. } => *rom_bank,
             Mbc::Mbc2 { rom_bank, .. } => *rom_bank,
+            Mbc::Mbc3 { rom_bank, .. } => *rom_bank,
             _ => 0,
         }
     }
@@ -179,6 +319,7 @@ impl Cartridge {
     pub fn ram_bank(&self) -> u8 {
         match &self.mbc {
             Mbc::Mbc1 { ram_bank, .. } => *ram_bank,
+            Mbc::Mbc3 { ram_bank_or_rtc, .. } => *ram_bank_or_rtc,
             _ => 0,
         }
     }
@@ -188,6 +329,7 @@ impl Cartridge {
         match &self.mbc {
             Mbc::Mbc1 { ram_enabled, .. } => *ram_enabled,
             Mbc::Mbc2 { ram_enabled, .. } => *ram_enabled,
+            Mbc::Mbc3 { ram_enabled, .. } => *ram_enabled,
             _ => false,
         }
     }
@@ -273,6 +415,37 @@ impl Cartridge {
                     _ => 0xFF,
                 }
             }
+            Mbc::Mbc3 { rom_bank, ram_bank_or_rtc, ram_enabled, rtc, .. } => {
+                match addr {
+                    // the first bank is fixed
+                    0x0000..=0x3FFF => self.rom.get(addr as usize).copied().unwrap_or(0xFF),
+                    
+                    // selected bank
+                    0x4000..=0x7FFF => {
+                        let num_rom_banks = (self.rom.len() / 0x4000).max(1);
+                        let bank = (*rom_bank as usize) % num_rom_banks;
+                        let rom_addr = bank * 0x4000 + ((addr - 0x4000) as usize);
+                        self.rom.get(rom_addr).copied().unwrap_or(0xFF)
+                    }
+
+                    // RAM o RTC
+                    0xA000..=0xBFFF => {
+                        if *ram_enabled {
+                            if *ram_bank_or_rtc <= 0x03 && !self.ram.is_empty() { // reding from RAM (0..=3)
+                                let ram_addr = (*ram_bank_or_rtc as usize * 8192) + ((addr - 0xA000) as usize);
+                                self.ram.get(ram_addr % self.ram.len()).copied().unwrap_or(0xFF)
+                            } else if *ram_bank_or_rtc >= 0x08 && *ram_bank_or_rtc <= 0x0C { // reading from RTC
+                                rtc.read_reg(*ram_bank_or_rtc)
+                            } else {
+                                0xFF
+                            }
+                        } else {
+                            0xFF
+                        }
+                    }
+                    _ => 0xFF,
+                }
+            }
             _ => 0xFF,
         }
     } 
@@ -324,6 +497,44 @@ impl Cartridge {
                         if *ram_enabled && !self.ram.is_empty() {
                             let ram_addr = ((addr - 0xA000) & 0x01FF) as usize;
                             self.ram[ram_addr] = val & 0x0F;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Mbc::Mbc3 { rom_bank, ram_bank_or_rtc, ram_enabled, rtc, rtc_latch } => {
+                match addr {
+                    // enable RAM and RTC
+                    0x0000..=0x1FFF => {
+                        *ram_enabled = (val & 0x0F) == 0x0A;
+                    }
+                    // select ROM bank
+                    0x2000..=0x3FFF => {
+                        let bank = val & 0x7F;
+                        *rom_bank = if bank == 0 { 1 } else { bank };
+                    }
+                    // RAM Bank / RTC Register Select
+                    0x4000..=0x5FFF => {
+                        *ram_bank_or_rtc = val;
+                    }
+                    // latch RTC
+                    0x6000..=0x7FFF => {
+                        if *rtc_latch == 0x00 && val == 0x01 {
+                            rtc.latch();
+                        }
+                        *rtc_latch = val;
+                    }
+                    // writing on ram or RTC, depending on what's enabled
+                    0xA000..=0xBFFF => {
+                        if *ram_enabled {
+                            if *ram_bank_or_rtc <= 0x03 && !self.ram.is_empty() {
+                                let ram_addr = (*ram_bank_or_rtc as usize * 8192) + ((addr - 0xA000) as usize);
+                                let len = self.ram.len();
+                                self.ram[ram_addr % len] = val;
+                            } else if *ram_bank_or_rtc >= 0x08 && *ram_bank_or_rtc <= 0x0C {
+                                // Scrittura nel registro RTC attivo!
+                                rtc.write_reg(*ram_bank_or_rtc, val);
+                            }
                         }
                     }
                     _ => {}
@@ -549,5 +760,131 @@ mod tests {
         cart.write(0x0200, 0x00);
         assert!(!cart.ram_enabled());
         assert_eq!(cart.read(0xA000), 0xFF);
+    }
+
+    #[test]
+    fn test_mbc3_rom_banking() {
+        // 2 MiB ROM (code 0x06 = 128 banks), MBC3 (code 0x11), RAM code 0
+        let mut rom = make_test_rom(0x11, 0x06, 0x00);
+
+        // Fill Bank 0, 1, 2, 65
+        rom[0x0000..0x0100].fill(0xAA);
+        rom[0x0150..0x4000].fill(0xAA);
+        rom[0x4000..0x8000].fill(0x11);
+        rom[2 * 0x4000..3 * 0x4000].fill(0x22);
+        rom[65 * 0x4000..66 * 0x4000].fill(0x66);
+
+        let mut cart = Cartridge::new(rom).unwrap();
+        assert_eq!(cart.header.cartridge_type, CartridgeType::Mbc3);
+
+        // Default state: Bank 1 is mapped at 0x4000..=0x7FFF
+        assert_eq!(cart.read(0x4000), 0x11);
+        assert_eq!(cart.rom_bank(), 1);
+
+        // Switch to Bank 2 (7-bit register at 0x2000)
+        cart.write(0x2000, 2);
+        assert_eq!(cart.rom_bank(), 2);
+        assert_eq!(cart.read(0x4000), 0x22);
+
+        // Switch to Bank 65 (direct 7-bit, unlike MBC1!)
+        cart.write(0x2000, 65);
+        assert_eq!(cart.rom_bank(), 65);
+        assert_eq!(cart.read(0x4000), 0x66);
+
+        // Quirk: writing 0 selects Bank 1
+        cart.write(0x2000, 0);
+        assert_eq!(cart.rom_bank(), 1);
+        assert_eq!(cart.read(0x4000), 0x11);
+    }
+
+    #[test]
+    fn test_mbc3_ram_banking() {
+        // 64 KiB ROM, 32 KiB RAM (4 banks of 8 KiB), MBC3+RAM+BATTERY (code 0x13)
+        let rom = make_test_rom(0x13, 0x01, 0x03);
+        let mut cart = Cartridge::new(rom).unwrap();
+
+        // RAM disabled by default: reads return 0xFF and writes are ignored
+        assert_eq!(cart.read(0xA000), 0xFF);
+        cart.write(0xA000, 0x42);
+        assert_eq!(cart.read(0xA000), 0xFF);
+
+        // Enable RAM by writing 0x0A to 0x0000..=0x1FFF
+        cart.write(0x0000, 0x0A);
+        assert!(cart.ram_enabled());
+
+        // Write and read from Bank 0
+        cart.write(0xA000, 0x55);
+        assert_eq!(cart.read(0xA000), 0x55);
+
+        // Switch to RAM Bank 1 by writing to 0x4000..=0x5FFF
+        cart.write(0x4000, 1);
+        assert_eq!(cart.ram_bank(), 1);
+        cart.write(0xA000, 0x77);
+        assert_eq!(cart.read(0xA000), 0x77);
+
+        // Switch back to RAM Bank 0: Bank 0 should still hold 0x55!
+        cart.write(0x4000, 0);
+        assert_eq!(cart.ram_bank(), 0);
+        assert_eq!(cart.read(0xA000), 0x55);
+
+        // Disable RAM
+        cart.write(0x0000, 0x00);
+        assert!(!cart.ram_enabled());
+        assert_eq!(cart.read(0xA000), 0xFF);
+    }
+
+    #[test]
+    fn test_mbc3_rtc_registers_and_latch() {
+        // 64 KiB ROM, MBC3+TIMER+RAM+BATTERY (code 0x10), 32 KiB RAM (code 0x03)
+        let rom = make_test_rom(0x10, 0x01, 0x03);
+        let mut cart = Cartridge::new(rom).unwrap();
+
+        // Enable RAM and Timer access by writing 0x0A to 0x0000
+        cart.write(0x0000, 0x0A);
+        assert!(cart.ram_enabled());
+
+        // Write active RTC registers via 0xA000:
+        // Seconds (0x08): 45
+        cart.write(0x4000, 0x08);
+        cart.write(0xA000, 45);
+
+        // Minutes (0x09): 30
+        cart.write(0x4000, 0x09);
+        cart.write(0xA000, 30);
+
+        // Hours (0x0A): 14 (2 PM)
+        cart.write(0x4000, 0x0A);
+        cart.write(0xA000, 14);
+
+        // Days Low (0x0B): 100
+        cart.write(0x4000, 0x0B);
+        cart.write(0xA000, 100);
+
+        // Days High / Flags (0x0C): 0x41 (bit 0 = day bit 8, bit 6 = halt)
+        cart.write(0x4000, 0x0C);
+        cart.write(0xA000, 0x41);
+
+        // Before latching, reads return 0 (initial latched state)
+        assert_eq!(cart.read(0xA000), 0);
+
+        // Latch clock data: write 0x00 then 0x01 to 0x6000
+        cart.write(0x6000, 0x00);
+        cart.write(0x6000, 0x01);
+
+        // Verify that latched values can now be read:
+        cart.write(0x4000, 0x08);
+        assert_eq!(cart.read(0xA000), 45);
+
+        cart.write(0x4000, 0x09);
+        assert_eq!(cart.read(0xA000), 30);
+
+        cart.write(0x4000, 0x0A);
+        assert_eq!(cart.read(0xA000), 14);
+
+        cart.write(0x4000, 0x0B);
+        assert_eq!(cart.read(0xA000), 100);
+
+        cart.write(0x4000, 0x0C);
+        assert_eq!(cart.read(0xA000), 0x41);
     }
 }
