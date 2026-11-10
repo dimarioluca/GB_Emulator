@@ -89,6 +89,7 @@ impl Ppu {
             self.LY = 0;
             self.dot_clock = 0;
             self.STAT &= !0x03; // Mode 0
+            self.window_line_counter = 0;
             return;
         }
 
@@ -105,6 +106,7 @@ impl Ppu {
                 self.set_mode(1, if_flag);
                 *if_flag |= 0x01; // Bit 0 of IF = V-Blank interrupt
                 self.frame_ready = true;
+                self.window_line_counter = 0;
             } else if self.LY > 153 {
                 // End of V-Blank: frame completed, reset to scanline 0
                 self.LY = 0;
@@ -206,7 +208,7 @@ impl Ppu {
             return;
         }
         else {
-            let tile_row: u8 = self.window_line_counter / 8; // each tile is 8 pixels high
+            let tile_row: u8 = (self.window_line_counter / 8) % 32; // each tile is 8 pixels high (32 rows per map)
             let tile_y: u8 = self.window_line_counter % 8; // y within the tile
 
             // calculate the base address of the window tile map and current row
@@ -249,7 +251,7 @@ impl Ppu {
                 let idx: usize = (self.LY as usize * 160 + x as usize) * 4;
                 self.framebuffer[idx..idx + 4].copy_from_slice(&rgba);
             }
-            self.window_line_counter += 1;
+            self.window_line_counter = self.window_line_counter.wrapping_add(1);
         }
     }
 
@@ -529,6 +531,58 @@ mod tests {
 
         // Pixel 1: BG has color 0 -> sprite is visible over color 0 -> Light grey
         assert_eq!(&ppu.framebuffer[4..8], &[170, 170, 170, 255]);
+    }
+
+    #[test]
+    fn test_ppu_window_line_counter_resets_on_lcd_disable_and_vblank() {
+        let mut ppu = Ppu::new();
+        let mut if_flag = 0u8;
+
+        ppu.LCDC = 0xF1; // LCD on, Window on, BG on
+        ppu.WY = 0;
+        ppu.WX = 7;
+
+        // Render 5 window scanlines
+        for line in 0..5 {
+            ppu.LY = line;
+            ppu.render_scanline();
+        }
+        assert_eq!(ppu.window_line_counter, 5);
+
+        // Disabling LCD should reset window_line_counter to 0
+        ppu.LCDC &= !0x80;
+        ppu.step(4, &mut if_flag);
+        assert_eq!(ppu.window_line_counter, 0);
+
+        // Re-enable LCD and advance to V-Blank (LY = 144)
+        ppu.LCDC |= 0x80;
+        for line in 0..10 {
+            ppu.LY = line;
+            ppu.render_scanline();
+        }
+        assert_eq!(ppu.window_line_counter, 10);
+
+        // Advance to line 144 (V-Blank)
+        ppu.LY = 143;
+        ppu.step(456, &mut if_flag); // Advances to LY = 144
+        assert_eq!(ppu.LY, 144);
+        assert_eq!(ppu.window_line_counter, 0); // Reset on V-Blank
+    }
+
+    #[test]
+    fn test_ppu_window_no_overflow() {
+        let mut ppu = Ppu::new();
+        ppu.LCDC = 0xF1;
+        ppu.WY = 0;
+        ppu.WX = 7;
+
+        // Render 300 scanlines without frame reset: must not panic with overflow!
+        for _ in 0..300 {
+            ppu.LY = 0;
+            ppu.render_scanline();
+        }
+        // Wrapping add: 300 % 256 = 44
+        assert_eq!(ppu.window_line_counter, 44);
     }
 }
 
