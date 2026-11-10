@@ -45,7 +45,7 @@ fn main() {
     };
 
     // Create the cartridge by parsing its header
-    let cartridge = match Cartridge::new(rom_bytes) {
+    let mut cartridge = match Cartridge::new(rom_bytes) {
         Ok(cart) => cart,
         Err(err) => {
             eprintln!("Error parsing cartridge: {}", err);
@@ -53,12 +53,27 @@ fn main() {
         }
     };
 
+    let sav_path = std::path::Path::new(rom_path).with_extension("sav");
+
+    // Load existing .sav save file if present
+    if cartridge.has_battery() {
+        match cartridge.battery_load_save(&sav_path) {
+            Ok(true) => println!("Loaded save file: {}", sav_path.display()),
+            Ok(false) => println!("No existing save file found (a new one will be created when saving)."),
+            Err(err) => eprintln!("Warning: failed to load save file {}: {}", sav_path.display(), err),
+        }
+    }
+
     println!("=== Game Boy Cartridge Info ===");
     println!("File:             {}", rom_path);
     println!("Title:            {}", cartridge.header.title);
     println!("Cartridge Type:   {:?}", cartridge.header.cartridge_type);
     println!("ROM Size:         {} KiB", cartridge.header.rom_size / 1024);
     println!("RAM Size:         {} KiB", cartridge.header.ram_size / 1024);
+    println!("Battery:          {}", if cartridge.has_battery() { "YES" } else { "NO" });
+    if cartridge.has_battery() {
+        println!("Save File:        {}", sav_path.display());
+    }
     println!(
         "Header Checksum:  {:#04X} ({})",
         cartridge.header.header_checksum,
@@ -132,6 +147,11 @@ fn main() {
         match event {
             // Window close button clicked
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
+                match bus.cartridge.battery_save(&sav_path) {
+                    Ok(true) => println!("Saved game to {}", sav_path.display()),
+                    Ok(false) => {},
+                    Err(err) => eprintln!("Error saving game to {}: {}", sav_path.display(), err),
+                }
                 elwt.exit();
             }
             // Keyboard input events
@@ -276,6 +296,14 @@ fn main() {
             // Request redraw on idle to keep the emulator running at display refresh rate
             Event::AboutToWait => {
                 window.request_redraw();
+            }
+            // Save state on any loop exit (e.g. fatal error or window close)
+            Event::LoopExiting => {
+                match bus.cartridge.battery_save(&sav_path) {
+                    Ok(true) => println!("Saved game to {}", sav_path.display()),
+                    Ok(false) => {},
+                    Err(err) => eprintln!("Error saving game to {}: {}", sav_path.display(), err),
+                }
             }
             _ => {}
         }

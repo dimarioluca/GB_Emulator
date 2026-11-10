@@ -40,6 +40,7 @@ pub struct CartridgeHeader {
     pub ram_size: usize,
     pub header_checksum: u8,
     pub is_checksum_valid: bool,
+    pub has_battery: bool,
 }
 
 impl CartridgeHeader {
@@ -63,6 +64,12 @@ impl CartridgeHeader {
 
         // cartridge type (0x0147)
         let cartridge_type = CartridgeType::from(data[0x0147]);
+
+        // Has battery-backed RAM / timer (0x0147)
+        let has_battery = matches!(
+            data[0x0147],
+            0x03 | 0x06 | 0x09 | 0x0D | 0x0F | 0x10 | 0x13 | 0x1B | 0x1E | 0x20 | 0x22 | 0xFF
+        );
 
         // ROM size (0x0148): 32 KiB * (1 << codice)
         let rom_size_code = data[0x0148];
@@ -98,6 +105,7 @@ impl CartridgeHeader {
             ram_size,
             header_checksum,
             is_checksum_valid,
+            has_battery,
         })
     }
 }
@@ -259,6 +267,7 @@ pub struct Cartridge {
     pub rom: Vec<u8>,
     pub ram: Vec<u8>,
     pub mbc: Mbc,
+    pub ram_dirty: bool,
 }
 
 impl Cartridge {
@@ -301,7 +310,57 @@ impl Cartridge {
             rom, 
             ram,
             mbc,
+            ram_dirty: false,
         })
+    }
+
+    /// Returns `true` if this cartridge has battery-backed save memory.
+    pub fn has_battery(&self) -> bool {
+        self.header.has_battery
+    }
+
+    /// Loads battery-backed RAM from a `.sav` file if it exists.
+    ///
+    /// Returns `Ok(true)` if data was loaded, `Ok(false)` if the file didn't exist
+    /// or if the cartridge has no RAM, or `Err` if an I/O error occurred.
+    pub fn battery_load_save<P: AsRef<std::path::Path>>(&mut self, path: P) -> std::io::Result<bool> {
+        if self.ram.is_empty() {
+            return Ok(false);
+        }
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(false);
+        }
+        let data = std::fs::read(path)?;
+        let copy_len = self.ram.len().min(data.len());
+        self.ram[..copy_len].copy_from_slice(&data[..copy_len]);
+        self.ram_dirty = false;
+        Ok(true)
+    }
+
+    /// Saves battery-backed RAM to a `.sav` file.
+    ///
+    /// Only saves if the cartridge has a battery (or a save file already exists on disk),
+    /// has non-empty RAM, and the RAM has been modified (`ram_dirty`).
+    ///
+    /// Returns `Ok(true)` if data was saved, `Ok(false)` if no save was needed,
+    /// or `Err` if an I/O error occurred.
+    pub fn battery_save<P: AsRef<std::path::Path>>(&mut self, path: P) -> std::io::Result<bool> {
+        let path = path.as_ref();
+        let should_save = (self.header.has_battery || path.exists()) && !self.ram.is_empty() && self.ram_dirty;
+        if !should_save {
+            return Ok(false);
+        }
+
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+
+        std::fs::write(path, &self.ram)?;
+        self.ram_dirty = false;
+        Ok(true)
     }
 
     // Helper methods to inspect MBC state (useful for tests and debugging)
@@ -455,7 +514,10 @@ impl Cartridge {
         match &mut self.mbc {
             Mbc::RomOnly => {
                 match addr {
-                    0xA000..=0xBFFF if (self.ram.len() > (addr - 0xA000) as usize) => self.ram[(addr - 0xA000) as usize] = val, // it's trying to write to cartridge's ram
+                    0xA000..=0xBFFF if (self.ram.len() > (addr - 0xA000) as usize) => {
+                        self.ram[(addr - 0xA000) as usize] = val;
+                        self.ram_dirty = true;
+                    }
                     _ => {},
                 }
             }
@@ -478,6 +540,7 @@ impl Cartridge {
                             let ram_addr = (bank * 8192) + ((addr - 0xA000) as usize);
                             let len = self.ram.len();
                             self.ram[ram_addr % len] = val;
+                            self.ram_dirty = true;
                         }
                     }
                     _ => {}
@@ -497,6 +560,7 @@ impl Cartridge {
                         if *ram_enabled && !self.ram.is_empty() {
                             let ram_addr = ((addr - 0xA000) & 0x01FF) as usize;
                             self.ram[ram_addr] = val & 0x0F;
+                            self.ram_dirty = true;
                         }
                     }
                     _ => {}
@@ -531,6 +595,7 @@ impl Cartridge {
                                 let ram_addr = (*ram_bank_or_rtc as usize * 8192) + ((addr - 0xA000) as usize);
                                 let len = self.ram.len();
                                 self.ram[ram_addr % len] = val;
+                                self.ram_dirty = true;
                             } else if *ram_bank_or_rtc >= 0x08 && *ram_bank_or_rtc <= 0x0C {
                                 // Scrittura nel registro RTC attivo!
                                 rtc.write_reg(*ram_bank_or_rtc, val);
@@ -886,5 +951,61 @@ mod tests {
 
         cart.write(0x4000, 0x0C);
         assert_eq!(cart.read(0xA000), 0x41);
+    }
+
+    #[test]
+    fn test_cartridge_header_battery_detection() {
+        // Types with battery
+        assert!(CartridgeHeader::from_bytes(&make_test_rom(0x03, 0, 1)).unwrap().has_battery); // MBC1+RAM+BATTERY
+        assert!(CartridgeHeader::from_bytes(&make_test_rom(0x06, 0, 0)).unwrap().has_battery); // MBC2+BATTERY
+        assert!(CartridgeHeader::from_bytes(&make_test_rom(0x09, 0, 1)).unwrap().has_battery); // ROM+RAM+BATTERY
+        assert!(CartridgeHeader::from_bytes(&make_test_rom(0x0F, 0, 0)).unwrap().has_battery); // MBC3+TIMER+BATTERY
+        assert!(CartridgeHeader::from_bytes(&make_test_rom(0x10, 0, 1)).unwrap().has_battery); // MBC3+TIMER+RAM+BATTERY
+        assert!(CartridgeHeader::from_bytes(&make_test_rom(0x13, 0, 1)).unwrap().has_battery); // MBC3+RAM+BATTERY
+        assert!(CartridgeHeader::from_bytes(&make_test_rom(0x1B, 0, 1)).unwrap().has_battery); // MBC5+RAM+BATTERY
+
+        // Types without battery
+        assert!(!CartridgeHeader::from_bytes(&make_test_rom(0x00, 0, 0)).unwrap().has_battery); // ROM ONLY
+        assert!(!CartridgeHeader::from_bytes(&make_test_rom(0x01, 0, 0)).unwrap().has_battery); // MBC1
+        assert!(!CartridgeHeader::from_bytes(&make_test_rom(0x02, 0, 1)).unwrap().has_battery); // MBC1+RAM
+        assert!(!CartridgeHeader::from_bytes(&make_test_rom(0x05, 0, 0)).unwrap().has_battery); // MBC2
+        assert!(!CartridgeHeader::from_bytes(&make_test_rom(0x11, 0, 0)).unwrap().has_battery); // MBC3
+        assert!(!CartridgeHeader::from_bytes(&make_test_rom(0x12, 0, 1)).unwrap().has_battery); // MBC3+RAM
+    }
+
+    #[test]
+    fn test_battery_save_save_and_load() {
+        use std::env;
+        let rom = make_test_rom(0x03, 0x01, 0x02); // MBC1+RAM+BATTERY, 8 KiB RAM
+        let mut cart = Cartridge::new(rom.clone()).unwrap();
+
+        let temp_dir = env::temp_dir();
+        let sav_path = temp_dir.join(format!("test_save_{}.sav", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+
+        // Enable RAM and write data
+        cart.write(0x0000, 0x0A);
+        cart.write(0xA000, 0x42);
+        cart.write(0xA001, 0x99);
+        assert!(cart.ram_dirty);
+
+        // Save to temporary .sav file
+        let saved = cart.battery_save(&sav_path).unwrap();
+        assert!(saved);
+        assert!(!cart.ram_dirty);
+
+        // Second immediate save should return false (not dirty)
+        let saved_again = cart.battery_save(&sav_path).unwrap();
+        assert!(!saved_again);
+
+        // Create fresh cartridge and load the save
+        let mut loaded_cart = Cartridge::new(rom).unwrap();
+        assert_eq!(loaded_cart.ram[0], 0);
+        let loaded = loaded_cart.battery_load_save(&sav_path).unwrap();
+        assert!(loaded);
+        assert_eq!(loaded_cart.ram[0], 0x42);
+        assert_eq!(loaded_cart.ram[1], 0x99);
+
+        // Cleanup temp file
+        let _ = std::fs::remove_file(sav_path);
     }
 }
