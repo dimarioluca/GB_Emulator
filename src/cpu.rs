@@ -54,57 +54,57 @@ impl Cpu {
     }
 
     /// Gets the combined 16-bit AF register value.
-    pub fn af(&self) -> u16 {
+    fn af(&self) -> u16 {
         ((self.a as u16) << 8) | (self.f as u16)
     }
 
     /// Sets the combined 16-bit AF register value.
     /// Note: The lower 4 bits of F are hardwired to zero in Game Boy hardware.
-    pub fn set_af(&mut self, val: u16) {
+    fn set_af(&mut self, val: u16) {
         self.a = (val >> 8) as u8;
         self.f = (val as u8) & 0xF0;
     }
 
     /// Gets the combined 16-bit BC register value.
-    pub fn bc(&self) -> u16 {
+    fn bc(&self) -> u16 {
         ((self.b as u16) << 8) | (self.c as u16)
     }
 
     /// Sets the combined 16-bit BC register value.
-    pub fn set_bc(&mut self, val: u16) {
+    fn set_bc(&mut self, val: u16) {
         self.b = (val >> 8) as u8;
         self.c = val as u8;
     }
 
     /// Gets the combined 16-bit DE register value.
-    pub fn de(&self) -> u16 {
+    fn de(&self) -> u16 {
         ((self.d as u16) << 8) | (self.e as u16)
     }
 
     /// Sets the combined 16-bit DE register value.
-    pub fn set_de(&mut self, val: u16) {
+    fn set_de(&mut self, val: u16) {
         self.d = (val >> 8) as u8;
         self.e = val as u8;
     }
 
     /// Gets the combined 16-bit HL register value.
-    pub fn hl(&self) -> u16 {
+    fn hl(&self) -> u16 {
         ((self.h as u16) << 8) | (self.l as u16)
     }
 
     /// Sets the combined 16-bit HL register value.
-    pub fn set_hl(&mut self, val: u16) {
+    fn set_hl(&mut self, val: u16) {
         self.h = (val >> 8) as u8;
         self.l = val as u8;
     }
 
     /// Returns true if the Zero (Z) flag is set.
-    pub fn flag_z(&self) -> bool {
+    fn flag_z(&self) -> bool {
         (self.f & 0x80) != 0
     }
 
     /// Sets or clears the Zero (Z) flag (Bit 7 of F).
-    pub fn set_flag_z(&mut self, val: bool) {
+    fn set_flag_z(&mut self, val: bool) {
         if val {
             self.f |= 0x80;
         } else {
@@ -113,12 +113,12 @@ impl Cpu {
     }
 
     /// Returns true if the Subtraction (N) flag is set.
-    pub fn flag_n(&self) -> bool {
+    fn flag_n(&self) -> bool {
         (self.f & 0x40) != 0
     }
 
     /// Sets or clears the Subtraction (N) flag (Bit 6 of F).
-    pub fn set_flag_n(&mut self, val: bool) {
+    fn set_flag_n(&mut self, val: bool) {
         if val {
             self.f |= 0x40;
         } else {
@@ -127,12 +127,12 @@ impl Cpu {
     }
 
     /// Returns true if the Half-Carry (H) flag is set.
-    pub fn flag_h(&self) -> bool {
+    fn flag_h(&self) -> bool {
         (self.f & 0x20) != 0
     }
 
     /// Sets or clears the Half-Carry (H) flag (Bit 5 of F).
-    pub fn set_flag_h(&mut self, val: bool) {
+    fn set_flag_h(&mut self, val: bool) {
         if val {
             self.f |= 0x20;
         } else {
@@ -141,12 +141,12 @@ impl Cpu {
     }
 
     /// Returns true if the Carry (C) flag is set.
-    pub fn flag_c(&self) -> bool {
+    fn flag_c(&self) -> bool {
         (self.f & 0x10) != 0
     }
 
     /// Sets or clears the Carry (C) flag (Bit 4 of F).
-    pub fn set_flag_c(&mut self, val: bool) {
+    fn set_flag_c(&mut self, val: bool) {
         if val {
             self.f |= 0x10;
         } else {
@@ -155,7 +155,7 @@ impl Cpu {
     }
 
     /// Adds `val` to register A and updates the Z, N, H, and C flags.
-    pub fn alu_add(&mut self, val: u8) {
+    fn alu_add(&mut self, val: u8) {
         let res = self.a.wrapping_add(val);
 
         self.set_flag_z(res == 0); // set z to true if result is 0
@@ -173,7 +173,7 @@ impl Cpu {
     }
 
     /// Adds `val` plus the Carry flag to register A and updates the Z, N, H, and C flags.
-    pub fn alu_adc(&mut self, val: u8) {
+    fn alu_adc(&mut self, val: u8) {
         let c = if self.flag_c() { 1 } else { 0 };
         let res = self.a.wrapping_add(val).wrapping_add(c);
 
@@ -187,7 +187,7 @@ impl Cpu {
     }
 
     /// Subtracts `val` from register A and updates the Z, N, H, and C flags.
-    pub fn alu_sub(&mut self, val: u8) {
+    fn alu_sub(&mut self, val: u8) {
         let res = self.a.wrapping_sub(val);
 
         self.set_flag_z(res == 0);
@@ -205,7 +205,7 @@ impl Cpu {
     }
 
     /// Subtracts `val` and the Carry flag from register A and updates the Z, N, H, and C flags.
-    pub fn alu_sbc(&mut self, val: u8) {
+    fn alu_sbc(&mut self, val: u8) {
         let c = if self.flag_c() { 1 } else { 0 };
 
         let res = self.a.wrapping_sub(val).wrapping_sub(c);
@@ -223,7 +223,7 @@ impl Cpu {
     }
 
     /// Compares register A with `val` by calculating `A - val` and updating flags without modifying A.
-    pub fn alu_cp(&mut self, val: u8) { // it's the same as sub, but without saving the result
+    fn alu_cp(&mut self, val: u8) { // it's the same as sub, but without saving the result
         let res = self.a.wrapping_sub(val);
 
         self.set_flag_z(res == 0);
@@ -237,7 +237,7 @@ impl Cpu {
     }
 
     /// Performs bitwise AND between register A and `val`. Resets N and C, sets H to 1.
-    pub fn alu_and(&mut self, val: u8) {
+    fn alu_and(&mut self, val: u8) {
         self.a &= val;
         self.set_flag_z(self.a == 0);
         self.set_flag_n(false);
@@ -246,7 +246,7 @@ impl Cpu {
     }
 
     /// Performs bitwise OR between register A and `val`. Resets N, H, and C.
-    pub fn alu_or(&mut self, val: u8) {
+    fn alu_or(&mut self, val: u8) {
         self.a |= val;
         self.set_flag_z(self.a == 0);
         self.set_flag_n(false);
@@ -255,7 +255,7 @@ impl Cpu {
     }
 
     /// Performs bitwise XOR between register A and `val`. Resets N, H, and C.
-    pub fn alu_xor(&mut self, val: u8) {
+    fn alu_xor(&mut self, val: u8) {
         self.a ^= val;
         self.set_flag_z(self.a == 0);
         self.set_flag_n(false);
@@ -264,7 +264,7 @@ impl Cpu {
     }
 
     /// Increments `val` by 1 and updates the Z, N, and H flags. Carry flag is preserved.
-    pub fn alu_inc(&mut self, val: u8) -> u8 {
+    fn alu_inc(&mut self, val: u8) -> u8 {
         let res = val.wrapping_add(1);
         self.set_flag_z(res == 0);
         self.set_flag_n(false);
@@ -273,7 +273,7 @@ impl Cpu {
     }
 
     /// Decrements `val` by 1 and updates the Z, N, and H flags. Carry flag is preserved.
-    pub fn alu_dec(&mut self, val: u8) -> u8 {
+    fn alu_dec(&mut self, val: u8) -> u8 {
         let res = val.wrapping_sub(1);
         self.set_flag_z(res == 0);
         self.set_flag_n(true);
@@ -314,7 +314,7 @@ impl Cpu {
     }
 
     /// Checks and services pending hardware interrupts according to their priority.
-    pub fn handle_interrupts(&mut self, bus: &mut Bus) -> Option<u32> {
+    fn handle_interrupts(&mut self, bus: &mut Bus) -> Option<u32> {
         let pending = bus.ie & bus.if_flag & 0x1F;
 
         if pending != 0 {self.halted = false;}
@@ -348,7 +348,7 @@ impl Cpu {
     }
 
     /// Adds a 16-bit value to HL and updates H and C flags (Z flag is preserved, N is cleared).
-    pub fn add_hl(&mut self, val: u16) {
+    fn add_hl(&mut self, val: u16) {
         let hl = self.hl();
         let res = hl.wrapping_add(val);
         self.set_flag_n(false);
@@ -358,7 +358,7 @@ impl Cpu {
     }
 
     /// Decimal Adjust Accumulator (DAA): adjusts register A into Binary-Coded Decimal (BCD).
-    pub fn daa(&mut self) {
+    fn daa(&mut self) {
         let mut adjust = 0;
         let mut carry = false;
         if self.flag_h() || (!self.flag_n() && (self.a & 0x0F) > 0x09) {
@@ -411,7 +411,7 @@ impl Cpu {
     }
 
     /// Executes a prefix 0xCB instruction and returns the T-cycles elapsed.
-    pub fn execute_cb(&mut self, bus: &mut Bus) -> u32 {
+    fn execute_cb(&mut self, bus: &mut Bus) -> u32 {
         let cb_op = self.fetch_byte(bus);
         let reg_idx = cb_op & 0x07;
         let val = self.get_reg_cb(bus, reg_idx);

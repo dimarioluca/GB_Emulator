@@ -8,7 +8,8 @@ mod timer;
 use bus::Bus;
 use cartridge::Cartridge;
 use cpu::Cpu;
-use gilrs::{Axis, Button, EventType, Gilrs};
+use gilrs::ff::{BaseEffect, BaseEffectType, EffectBuilder, Replay, Ticks};
+use gilrs::{Axis, Button, EventType, GamepadId, Gilrs};
 use joypad::JoypadKey;
 use pixels::{PixelsBuilder, SurfaceTexture, ScalingMode};
 use pixels::wgpu::BlendState;
@@ -143,6 +144,12 @@ fn main() {
     let mut stick_down = false;
     const STICK_DEADZONE: f32 = 0.5;
 
+    // Track the first connected gamepad for rumble targeting
+    let mut active_gamepad: Option<GamepadId> = None;
+    // Current active rumble effect (None when motor is off)
+    let mut rumble_effect: Option<gilrs::ff::Effect> = None;
+    let mut last_rumble = false;
+
     event_loop.run(move |event, elwt| {
         match event {
             // Window close button clicked
@@ -247,9 +254,19 @@ fn main() {
                             }
                             EventType::Connected => {
                                 println!("Gamepad connected: {}", g.gamepad(gilrs_event.id).name());
+                                // Track first connected pad for rumble
+                                if active_gamepad.is_none() {
+                                    active_gamepad = Some(gilrs_event.id);
+                                }
                             }
                             EventType::Disconnected => {
                                 println!("Gamepad disconnected: {}", g.gamepad(gilrs_event.id).name());
+                                // Clear rumble state if the active pad disconnected
+                                if active_gamepad == Some(gilrs_event.id) {
+                                    active_gamepad = None;
+                                    rumble_effect = None;
+                                    last_rumble = false;
+                                }
                             }
                             _ => {}
                         }
@@ -263,6 +280,49 @@ fn main() {
                     bus.ppu.step(cycles, &mut bus.if_flag);
                 }
                 bus.ppu.frame_ready = false;
+
+                // Drive rumble motor based on cartridge MBC5 rumble flag
+                if let Some(ref mut g) = gilrs {
+                    // Auto-detect first connected gamepad if not yet tracked
+                    if active_gamepad.is_none() {
+                        active_gamepad = g.gamepads().next().map(|(id, _)| id);
+                    }
+
+                    let rumble_now = bus.cartridge.is_rumble_active();
+                    if rumble_now != last_rumble {
+                        last_rumble = rumble_now;
+
+                        if rumble_now {
+                            // Build a looping strong-rumble effect and play it
+                            if let Some(id) = active_gamepad {
+                                let effect = EffectBuilder::new()
+                                    .add_effect(BaseEffect {
+                                        kind: BaseEffectType::Strong { magnitude: 0xFFFF },
+                                        scheduling: Replay {
+                                            play_for: Ticks::from_ms(500),
+                                            with_delay: Ticks::from_ms(0),
+                                            ..Default::default()
+                                        },
+                                        envelope: Default::default(),
+                                    })
+                                    .gamepads(&[id])
+                                    .finish(g);
+                                match effect {
+                                    Ok(e) => {
+                                        let _ = e.play();
+                                        rumble_effect = Some(e);
+                                    }
+                                    Err(err) => eprintln!("Warning: could not create rumble effect: {}", err),
+                                }
+                            }
+                        } else {
+                            // Stop the motor
+                            if let Some(e) = rumble_effect.take() {
+                                let _ = e.stop();
+                            }
+                        }
+                    }
+                }
 
                 let frame = pixels.frame_mut();
 
@@ -299,6 +359,10 @@ fn main() {
             }
             // Save state on any loop exit (e.g. fatal error or window close)
             Event::LoopExiting => {
+                // Stop rumble motor on exit (avoid controller staying vibrating)
+                if let Some(e) = rumble_effect.take() {
+                    let _ = e.stop();
+                }
                 match bus.cartridge.battery_save(&sav_path) {
                     Ok(true) => println!("Saved game to {}", sav_path.display()),
                     Ok(false) => {},

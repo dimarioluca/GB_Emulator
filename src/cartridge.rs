@@ -41,11 +41,12 @@ pub struct CartridgeHeader {
     pub header_checksum: u8,
     pub is_checksum_valid: bool,
     pub has_battery: bool,
+    pub has_rumble: bool,
 }
 
 impl CartridgeHeader {
     /// Parses the cartridge header from raw ROM bytes.
-    pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
+    fn from_bytes(data: &[u8]) -> Result<Self, String> {
         if data.len() < 0x0150 {
             return Err(format!(
                 "File ROM troppo piccolo ({} byte). Un header Game Boy richiede almeno 336 byte (0x0150).",
@@ -71,7 +72,10 @@ impl CartridgeHeader {
             0x03 | 0x06 | 0x09 | 0x0D | 0x0F | 0x10 | 0x13 | 0x1B | 0x1E | 0x20 | 0x22 | 0xFF
         );
 
-        // ROM size (0x0148): 32 KiB * (1 << codice)
+        // Has rumble motor (0x0147): MBC5+RUMBLE (0x1C..=0x1E)
+        let has_rumble = matches!(data[0x0147], 0x1C..=0x1E);
+
+        // ROM size (0x0148): 32 KiB * (1 << code)
         let rom_size_code = data[0x0148];
         let rom_size = match rom_size_code {
             0x00..=0x08 => (32 * 1024) << rom_size_code,
@@ -106,6 +110,7 @@ impl CartridgeHeader {
             header_checksum,
             is_checksum_valid,
             has_battery,
+            has_rumble,
         })
     }
 }
@@ -141,7 +146,7 @@ impl Default for Rtc {
 #[allow(dead_code)]
 impl Rtc {
     /// Creates a new [`Rtc`] instance with initial zeroed registers and real-time tracking enabled.
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             seconds: 0,
             minutes: 0,
@@ -158,7 +163,7 @@ impl Rtc {
     }
 
     /// Latches the current RTC registers into the read buffers.
-    pub fn latch(&mut self) {
+    fn latch(&mut self) {
         self.update_time();
         self.latched_seconds = self.seconds;
         self.latched_minutes = self.minutes;
@@ -168,7 +173,7 @@ impl Rtc {
     }
 
     /// Reads a latched RTC register (0x08..=0x0C).
-    pub fn read_reg(&self, reg: u8) -> u8 {
+    fn read_reg(&self, reg: u8) -> u8 {
         match reg {
             0x08 => self.latched_seconds,
             0x09 => self.latched_minutes,
@@ -180,7 +185,7 @@ impl Rtc {
     }
 
     /// Writes to an active RTC register (0x08..=0x0C).
-    pub fn write_reg(&mut self, reg: u8, val: u8) {
+    fn write_reg(&mut self, reg: u8, val: u8) {
         match reg {
             0x08 => self.seconds = val & 0x3F,   // 0..=59
             0x09 => self.minutes = val & 0x3F,   // 0..=59
@@ -192,7 +197,7 @@ impl Rtc {
     }
 
     /// Updates internal time registers based on elapsed real-world time.
-    pub fn update_time(&mut self) {
+    fn update_time(&mut self) {
         if let Some(last) = self.last_time {
             let now = std::time::Instant::now();
             let elapsed = now.duration_since(last).as_secs();
@@ -208,7 +213,7 @@ impl Rtc {
     }
 
     /// Adds seconds to the active RTC registers, propagating carries to minutes, hours, and days.
-    pub fn add_seconds(&mut self, secs: u64) {
+    fn add_seconds(&mut self, secs: u64) {
         if secs == 0 || (self.days_high & 0x40) != 0 {
             return;
         }
@@ -232,7 +237,7 @@ impl Rtc {
     }
 
     /// Returns the full 9-bit day count (0..=511).
-    pub fn days(&self) -> u16 {
+    fn days(&self) -> u16 {
         ((self.days_high as u16 & 1) << 8) | (self.days_low as u16)
     }
 }
@@ -258,7 +263,13 @@ pub enum Mbc {
         rtc: Rtc,
         rtc_latch: u8,        // previous value written to 0x6000..=0x7FFF
     },
-    Mbc5,
+    Mbc5 {
+        rom_bank: u16,      // 9-bit ROM bank selected (0..=511), unlike MBC1/2/3 bank 0 is allowed
+        ram_bank: u8,       // RAM bank selected: 4-bit (0..=15) without rumble, 3-bit (0..=7) with rumble
+        ram_enabled: bool,  // if cartridge RAM is enabled
+        has_rumble: bool,   // true if cartridge hardware includes a rumble motor
+        rumble_active: bool,// true when rumble motor is currently activated by the game
+    },
 }
 
 /// Represents a Game Boy cartridge containing ROM data, external RAM, and header metadata.
@@ -301,7 +312,13 @@ impl Cartridge {
                 rtc: Rtc::new(),
                 rtc_latch: 0xFF,
             },
-            CartridgeType::Mbc5 => Mbc::Mbc5,
+            CartridgeType::Mbc5 => Mbc::Mbc5 {
+                rom_bank: 1,
+                ram_bank: 0,
+                ram_enabled: false,
+                has_rumble: header.has_rumble,
+                rumble_active: false,
+            },
             CartridgeType::Unsupported(_) => Mbc::RomOnly,
         };
 
@@ -364,40 +381,64 @@ impl Cartridge {
     }
 
     // Helper methods to inspect MBC state (useful for tests and debugging)
+    /// Returns the currently selected ROM bank (as a 16-bit number to support MBC5's 512 banks).
     #[allow(dead_code)]
-    pub fn rom_bank(&self) -> u8 {
+    fn rom_bank(&self) -> u16 {
         match &self.mbc {
-            Mbc::Mbc1 { rom_bank, .. } => *rom_bank,
-            Mbc::Mbc2 { rom_bank, .. } => *rom_bank,
-            Mbc::Mbc3 { rom_bank, .. } => *rom_bank,
-            _ => 0,
+            Mbc::Mbc1 { rom_bank, ram_bank, .. } => {
+                ((*ram_bank as u16) << 5) | (*rom_bank as u16)
+            }
+            Mbc::Mbc2 { rom_bank, .. } => *rom_bank as u16,
+            Mbc::Mbc3 { rom_bank, .. } => *rom_bank as u16,
+            Mbc::Mbc5 { rom_bank, .. } => *rom_bank,
+            Mbc::RomOnly => 0,
         }
     }
 
+    /// Returns the currently selected RAM bank (or RTC register on MBC3).
     #[allow(dead_code)]
-    pub fn ram_bank(&self) -> u8 {
+    fn ram_bank(&self) -> u8 {
         match &self.mbc {
             Mbc::Mbc1 { ram_bank, .. } => *ram_bank,
             Mbc::Mbc3 { ram_bank_or_rtc, .. } => *ram_bank_or_rtc,
+            Mbc::Mbc5 { ram_bank, .. } => *ram_bank,
             _ => 0,
         }
     }
 
+    /// Returns `true` if external cartridge RAM (or RTC) is enabled.
     #[allow(dead_code)]
-    pub fn ram_enabled(&self) -> bool {
+    fn ram_enabled(&self) -> bool {
         match &self.mbc {
             Mbc::Mbc1 { ram_enabled, .. } => *ram_enabled,
             Mbc::Mbc2 { ram_enabled, .. } => *ram_enabled,
             Mbc::Mbc3 { ram_enabled, .. } => *ram_enabled,
+            Mbc::Mbc5 { ram_enabled, .. } => *ram_enabled,
             _ => false,
         }
     }
 
+    /// Returns the MBC1 banking mode (0 = ROM banking, 1 = RAM banking).
     #[allow(dead_code)]
-    pub fn banking_mode(&self) -> u8 {
+    fn banking_mode(&self) -> u8 {
         match &self.mbc {
             Mbc::Mbc1 { banking_mode, .. } => *banking_mode,
             _ => 0,
+        }
+    }
+
+    /// Returns `true` if this cartridge has hardware rumble motor support.
+    #[allow(dead_code)]
+    fn has_rumble(&self) -> bool {
+        self.header.has_rumble
+    }
+
+    /// Returns `true` if the rumble motor is currently activated by the game.
+    #[allow(dead_code)]
+    pub fn is_rumble_active(&self) -> bool {
+        match &self.mbc {
+            Mbc::Mbc5 { rumble_active, .. } => *rumble_active,
+            _ => false,
         }
     }
 
@@ -505,7 +546,29 @@ impl Cartridge {
                     _ => 0xFF,
                 }
             }
-            _ => 0xFF,
+            Mbc::Mbc5 { rom_bank, ram_bank, ram_enabled, .. } => {
+                match addr {
+                    // the first bank is fixed (Bank 0)
+                    0x0000..=0x3FFF => self.rom.get(addr as usize).copied().unwrap_or(0xFF),
+                    // reading the switchable bank (9-bit, bank 0 is allowed unlike MBC1/2/3)
+                    0x4000..=0x7FFF => {
+                        let num_rom_banks = (self.rom.len() / 0x4000).max(1);
+                        let bank = (*rom_bank as usize) % num_rom_banks;
+                        let rom_addr = bank * 0x4000 + ((addr - 0x4000) as usize);
+                        self.rom.get(rom_addr).copied().unwrap_or(0xFF)
+                    }
+                    // reading external ram
+                    0xA000..=0xBFFF => {
+                        if *ram_enabled && !self.ram.is_empty() {
+                            let ram_addr = (*ram_bank as usize * 8192) + ((addr - 0xA000) as usize);
+                            self.ram.get(ram_addr % self.ram.len()).copied().unwrap_or(0xFF)
+                        } else {
+                            0xFF
+                        }
+                    }
+                    _ => 0xFF,
+                }
+            }
         }
     } 
 
@@ -597,7 +660,7 @@ impl Cartridge {
                                 self.ram[ram_addr % len] = val;
                                 self.ram_dirty = true;
                             } else if *ram_bank_or_rtc >= 0x08 && *ram_bank_or_rtc <= 0x0C {
-                                // Scrittura nel registro RTC attivo!
+                                // writing to active RTC register
                                 rtc.write_reg(*ram_bank_or_rtc, val);
                             }
                         }
@@ -605,7 +668,45 @@ impl Cartridge {
                     _ => {}
                 }
             }
-            _ => {}
+            Mbc::Mbc5 {
+                rom_bank,
+                ram_bank,
+                ram_enabled,
+                has_rumble,
+                rumble_active,
+            } => {
+                match addr {
+                    // enable/disable RAM
+                    0x0000..=0x1FFF => { *ram_enabled = (val & 0x0F) == 0x0A; }
+                    // ROM bank lower 8 bits (keeps the 9th bit untouched)
+                    0x2000..=0x2FFF => {
+                        *rom_bank = (*rom_bank & 0x0100) | (val as u16);
+                    }
+                    // ROM bank 9th bit (keeps the lower 8 bits untouched)
+                    0x3000..=0x3FFF => {
+                        *rom_bank = (*rom_bank & 0x00FF) | (((val & 0x01) as u16) << 8);
+                    }
+                    // select RAM bank (and control rumble motor if present)
+                    0x4000..=0x5FFF => {
+                        if *has_rumble {
+                            *ram_bank = val & 0x07;             // 3 bits for RAM bank (0..=7)
+                            *rumble_active = (val & 0x08) != 0; // bit 3 controls rumble motor on/off
+                        } else {
+                            *ram_bank = val & 0x0F;             // 4 bits for RAM bank (0..=15)
+                        }
+                    }
+                    // normal write to external ram
+                    0xA000..=0xBFFF => {
+                        if *ram_enabled && !self.ram.is_empty() {
+                            let ram_addr = (*ram_bank as usize * 8192) + ((addr - 0xA000) as usize);
+                            let len = self.ram.len();
+                            self.ram[ram_addr % len] = val;
+                            self.ram_dirty = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 }
@@ -1007,5 +1108,179 @@ mod tests {
 
         // Cleanup temp file
         let _ = std::fs::remove_file(sav_path);
+    }
+
+    #[test]
+    fn test_mbc5_rom_banking() {
+        // 8 MiB ROM (code 0x08 = 512 banks), MBC5 (code 0x19), No RAM (code 0)
+        let mut rom = make_test_rom(0x19, 0x08, 0x00);
+
+        // Fill notable banks to identify them
+        rom[0x0000..0x0100].fill(0xAA);
+        rom[0x0150..0x4000].fill(0xAA);
+        rom[0x4000..0x8000].fill(0x11);                   // bank 1
+        rom[2 * 0x4000..3 * 0x4000].fill(0x22);           // bank 2
+        rom[255 * 0x4000..256 * 0x4000].fill(0xFF);       // bank 255
+        rom[256 * 0x4000..257 * 0x4000].fill(0xBB);       // bank 256 (needs 9th bit!)
+
+        let mut cart = Cartridge::new(rom).unwrap();
+        assert_eq!(cart.header.cartridge_type, CartridgeType::Mbc5);
+
+        // At startup, bank 1 is mapped at 0x4000..=0x7FFF
+        assert_eq!(cart.read(0x4000), 0x11);
+        assert_eq!(cart.rom_bank(), 1);
+
+        // Switch to bank 2 by writing lower 8 bits at 0x2000
+        cart.write(0x2000, 2);
+        assert_eq!(cart.rom_bank(), 2);
+        assert_eq!(cart.read(0x4000), 0x22);
+
+        // Switch to bank 255: only lower 8 bits, 9th bit stays 0
+        cart.write(0x2000, 255);
+        assert_eq!(cart.rom_bank(), 255);
+        assert_eq!(cart.read(0x4000), 0xFF);
+
+        // Switch to bank 256: set 9th bit at 0x3000, lower 8 bits to 0
+        cart.write(0x3000, 0x01); // 9th bit = 1 => 256
+        cart.write(0x2000, 0x00); // lower 8 bits = 0
+        assert_eq!(cart.rom_bank(), 256);
+        assert_eq!(cart.read(0x4000), 0xBB);
+
+        // Unlike MBC1/2/3: bank 0 is valid at 0x4000! (no remap to 1)
+        cart.write(0x3000, 0x00); // 9th bit = 0
+        cart.write(0x2000, 0x00); // lower 8 bits = 0 => bank 0!
+        assert_eq!(cart.rom_bank(), 0);
+        assert_eq!(cart.read(0x4000), 0xAA); // same data as bank 0 at 0x0000
+    }
+
+    #[test]
+    fn test_mbc5_ram_enable_and_banking() {
+        // 64 KiB ROM, MBC5+RAM+BATTERY (code 0x1B), 128 KiB RAM (code 0x04 = 16 banks)
+        let rom = make_test_rom(0x1B, 0x01, 0x04);
+        let mut cart = Cartridge::new(rom).unwrap();
+
+        // 1. RAM disabled by default: reads return 0xFF and writes are ignored
+        assert_eq!(cart.read(0xA000), 0xFF);
+        cart.write(0xA000, 0x42);
+        assert_eq!(cart.read(0xA000), 0xFF);
+
+        // 2. Enable RAM by writing 0x0A to 0x0000..=0x1FFF
+        cart.write(0x0000, 0x0A);
+        assert!(cart.ram_enabled());
+
+        // Write and read from Bank 0
+        cart.write(0xA000, 0x55);
+        assert_eq!(cart.read(0xA000), 0x55);
+
+        // 3. Switch to RAM Bank 1 by writing to 0x4000..=0x5FFF (4-bit register)
+        cart.write(0x4000, 1);
+        assert_eq!(cart.ram_bank(), 1);
+        cart.write(0xA000, 0x77);
+        assert_eq!(cart.read(0xA000), 0x77);
+
+        // Switch to RAM Bank 15 (max for MBC5)
+        cart.write(0x4000, 15);
+        assert_eq!(cart.ram_bank(), 15);
+        cart.write(0xA000, 0x99);
+        assert_eq!(cart.read(0xA000), 0x99);
+
+        // Switch back to RAM Bank 0: Bank 0 should still hold 0x55!
+        cart.write(0x4000, 0);
+        assert_eq!(cart.ram_bank(), 0);
+        assert_eq!(cart.read(0xA000), 0x55);
+
+        // 4. Disable RAM
+        cart.write(0x0000, 0x00);
+        assert!(!cart.ram_enabled());
+        assert_eq!(cart.read(0xA000), 0xFF);
+    }
+
+    #[test]
+    fn test_mbc5_9bit_rom_bank_register() {
+        // Verify the two separate registers (0x2000 and 0x3000) compose correctly
+        let rom = make_test_rom(0x19, 0x08, 0x00); // 8 MiB ROM, MBC5
+        let mut cart = Cartridge::new(rom).unwrap();
+
+        // Writing to 0x2000 only changes lower 8 bits
+        cart.write(0x2000, 0xAB);
+        assert_eq!(cart.rom_bank(), 0x00AB);
+
+        // Writing to 0x3000 only changes the 9th bit (bit 8), lower 8 bits untouched
+        cart.write(0x3000, 0x01);
+        assert_eq!(cart.rom_bank(), 0x01AB); // 0x100 | 0xAB = 427
+
+        // Writing to 0x2000 again only changes lower 8 bits, 9th bit stays set
+        cart.write(0x2000, 0x05);
+        assert_eq!(cart.rom_bank(), 0x0105); // 0x100 | 0x05 = 261
+
+        // Clear the 9th bit
+        cart.write(0x3000, 0x00);
+        assert_eq!(cart.rom_bank(), 0x0005); // just bank 5
+
+        // Only bit 0 of the value written to 0x3000 matters (val & 0x01)
+        cart.write(0x3000, 0xFE); // bit 0 = 0, so 9th bit stays 0
+        assert_eq!(cart.rom_bank(), 0x0005);
+        cart.write(0x3000, 0xFF); // bit 0 = 1, so 9th bit gets set
+        assert_eq!(cart.rom_bank(), 0x0105);
+    }
+
+    #[test]
+    fn test_mbc5_rumble() {
+        // MBC5+RUMBLE+RAM+BATTERY (code 0x1E), 64 KiB ROM, 32 KiB RAM
+        let rom = make_test_rom(0x1E, 0x01, 0x03);
+        let mut cart = Cartridge::new(rom).unwrap();
+
+        assert!(cart.has_rumble());
+        assert!(!cart.is_rumble_active());
+
+        // Enable RAM
+        cart.write(0x0000, 0x0A);
+        assert!(cart.ram_enabled());
+
+        // Writing 0x08 to 0x4000:
+        // bit 3 = 1 => turns rumble motor ON!
+        // bits 0..2 = 0 => selects RAM bank 0 (not bank 8!)
+        cart.write(0x4000, 0x08);
+        assert!(cart.is_rumble_active());
+        assert_eq!(cart.ram_bank(), 0);
+
+        // Write data to RAM bank 0
+        cart.write(0xA000, 0x42);
+        assert_eq!(cart.read(0xA000), 0x42);
+
+        // Writing 0x0B (in binary: 0000_1011) to 0x4000:
+        // bit 3 = 1 => rumble remains ON!
+        // bits 0..2 = 3 => selects RAM bank 3
+        cart.write(0x4000, 0x0B);
+        assert!(cart.is_rumble_active());
+        assert_eq!(cart.ram_bank(), 3);
+
+        // Write data to RAM bank 3
+        cart.write(0xA000, 0x99);
+        assert_eq!(cart.read(0xA000), 0x99);
+
+        // Writing 0x00 to 0x4000:
+        // bit 3 = 0 => turns rumble motor OFF!
+        // bits 0..2 = 0 => selects RAM bank 0
+        cart.write(0x4000, 0x00);
+        assert!(!cart.is_rumble_active());
+        assert_eq!(cart.ram_bank(), 0);
+        assert_eq!(cart.read(0xA000), 0x42); // bank 0 data preserved!
+    }
+
+    #[test]
+    fn test_cartridge_header_rumble_detection() {
+        // Cartridge types with rumble: 0x1C..=0x1E
+        assert!(CartridgeHeader::from_bytes(&make_test_rom(0x1C, 0, 0)).unwrap().has_rumble); // MBC5+RUMBLE
+        assert!(CartridgeHeader::from_bytes(&make_test_rom(0x1D, 0, 1)).unwrap().has_rumble); // MBC5+RUMBLE+RAM
+        assert!(CartridgeHeader::from_bytes(&make_test_rom(0x1E, 0, 1)).unwrap().has_rumble); // MBC5+RUMBLE+RAM+BATTERY
+
+        // Types without rumble
+        assert!(!CartridgeHeader::from_bytes(&make_test_rom(0x19, 0, 0)).unwrap().has_rumble); // MBC5
+        assert!(!CartridgeHeader::from_bytes(&make_test_rom(0x1A, 0, 1)).unwrap().has_rumble); // MBC5+RAM
+        assert!(!CartridgeHeader::from_bytes(&make_test_rom(0x1B, 0, 1)).unwrap().has_rumble); // MBC5+RAM+BATTERY
+        assert!(!CartridgeHeader::from_bytes(&make_test_rom(0x01, 0, 0)).unwrap().has_rumble); // MBC1
+        assert!(!CartridgeHeader::from_bytes(&make_test_rom(0x05, 0, 0)).unwrap().has_rumble); // MBC2
+        assert!(!CartridgeHeader::from_bytes(&make_test_rom(0x11, 0, 0)).unwrap().has_rumble); // MBC3
     }
 }
