@@ -1,14 +1,16 @@
-import { Button, VerticalBox, HorizontalBox, LineEdit } from "std-widgets.slint";
+import { Button, VerticalBox, HorizontalBox, LineEdit, StandardListView } from "std-widgets.slint";
 
 export component LauncherWindow inherits Window {
     title: "Game Boy Emulator";
     width: 520px;
-    height: 260px;
+    height: 380px;
 
-    in-out property <string> rom-path;
+    in-out property <string> folder-path;
+    in-out property <[StandardListViewItem]> games;
+    in-out property <int> selected-index: -1;
     in-out property <bool> busy: false;
 
-    callback open-rom-clicked();
+    callback select-folder-clicked();
     callback start-emulator-clicked();
 
     VerticalBox {
@@ -24,20 +26,25 @@ export component LauncherWindow inherits Window {
         HorizontalBox {
             spacing: 8px;
             LineEdit {
-                text: root.rom-path;
+                text: root.folder-path;
                 read-only: true;
-                placeholder-text: "No rom selected...";
+                placeholder-text: "No folder selected...";
             }
             Button {
-                text: "Open ROM";
+                text: "Select Folder";
                 enabled: !root.busy;
-                clicked => { root.open-rom-clicked(); }
+                clicked => { root.select-folder-clicked(); }
             }
+        }
+
+        StandardListView {
+            model: root.games;
+            current-item <=> root.selected-index;
         }
 
         Button {
             text: "Start Emulator";
-            enabled: root.rom-path != "" && !root.busy;
+            enabled: root.selected-index >= 0 && !root.busy;
             clicked => { root.start-emulator-clicked(); }
         }
     }
