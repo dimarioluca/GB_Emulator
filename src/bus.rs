@@ -14,7 +14,7 @@
 //! - `0xFF80..=0xFFFE`: High RAM (HRAM, 127 bytes)
 //! - `0xFFFF`: Interrupt Enable Register (IE)
 
-use crate::Cartridge;
+use crate::cartridge::Cartridge;
 use crate::joypad::Joypad;
 use crate::ppu::Ppu;
 use crate::timer::Timer;

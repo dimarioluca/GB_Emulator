@@ -1,0 +1,44 @@
+import { Button, VerticalBox, HorizontalBox, LineEdit } from "std-widgets.slint";
+
+export component LauncherWindow inherits Window {
+    title: "Game Boy Emulator";
+    width: 520px;
+    height: 260px;
+
+    in-out property <string> rom-path;
+    in-out property <bool> busy: false;
+
+    callback open-rom-clicked();
+    callback start-emulator-clicked();
+
+    VerticalBox {
+        padding: 20px;
+        spacing: 15px;
+
+        Text {
+            text: "Game Boy Emulator";
+            font-size: 22px;
+            horizontal-alignment: center;
+        }
+
+        HorizontalBox {
+            spacing: 8px;
+            LineEdit {
+                text: root.rom-path;
+                read-only: true;
+                placeholder-text: "No rom selected...";
+            }
+            Button {
+                text: "Open ROM";
+                enabled: !root.busy;
+                clicked => { root.open-rom-clicked(); }
+            }
+        }
+
+        Button {
+            text: "Start Emulator";
+            enabled: root.rom-path != "" && !root.busy;
+            clicked => { root.start-emulator-clicked(); }
+        }
+    }
+}
